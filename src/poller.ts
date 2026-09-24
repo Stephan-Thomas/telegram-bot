@@ -77,6 +77,39 @@ const INITIAL_BACKOFF_MS = 1_000;
 /** Maximum backoff in milliseconds for Telegram send retries. */
 const MAX_BACKOFF_MS = 10_000;
 
+/** Maximum time to back off based on Retry-After (1 hour). */
+const MAX_RETRY_AFTER_MS = 60 * 60 * 1000;
+
+export function extractRetryAfterMs(err: unknown): number | null {
+  if (!err || typeof err !== "object") return null;
+  const e = err as any;
+
+  let seconds: number | null = null;
+
+  if (typeof e.parameters?.retry_after === "number") {
+    seconds = e.parameters.retry_after;
+  } else {
+    const headers = e.response?.headers || e.headers;
+    if (headers) {
+      let val: any;
+      if (typeof headers.get === "function") {
+        val = headers.get("retry-after") || headers.get("Retry-After");
+      } else {
+        val = headers["retry-after"] || headers["Retry-After"];
+      }
+      if (typeof val === "string" || typeof val === "number") {
+        const parsed = parseInt(String(val), 10);
+        if (!Number.isNaN(parsed)) seconds = parsed;
+      }
+    }
+  }
+
+  if (seconds !== null && seconds > 0) {
+    return Math.min(seconds * 1000, MAX_RETRY_AFTER_MS);
+  }
+  return null;
+}
+
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function errMessage(err: unknown): string {
@@ -104,16 +137,24 @@ async function sendWithRetry(
       return;
     } catch (err) {
       attempt++;
-      if (attempt >= MAX_SEND_RETRIES) {
+      
+      const retryAfterMs = extractRetryAfterMs(err);
+      
+      if (attempt >= MAX_SEND_RETRIES && retryAfterMs === null) {
         throw err; // Exhausted retries
       }
+      
+      const delay = retryAfterMs !== null ? retryAfterMs : backoff;
+      
       console.warn(
-        `[poller] send attempt ${attempt} failed, retrying in ${backoff}ms: ` +
+        `[poller] send attempt ${attempt} failed, retrying in ${delay}ms: ` +
           errMessage(err),
       );
-      await sleep(backoff);
+      await sleep(delay);
       // Exponential backoff with cap
-      backoff = Math.min(backoff * 2, MAX_BACKOFF_MS);
+      if (retryAfterMs === null) {
+        backoff = Math.min(backoff * 2, MAX_BACKOFF_MS);
+      }
     }
   }
 }
@@ -257,13 +298,14 @@ export function createPoller(deps: PollerDeps) {
     }
   }
 
-  async function cycle(): Promise<void> {
+  async function cycle(): Promise<number | void> {
     if (inFlight) return;
     inFlight = true;
     status.cycles += 1;
     status.lastPollAt = Date.now();
 
     let anyOk = false;
+    let explicitBackoff: number | null = null;
 
     for (const target of targets) {
       const current = state.get(target.source);
@@ -293,9 +335,28 @@ export function createPoller(deps: PollerDeps) {
         if (scan.cursor) current.cursor = scan.cursor;
       } catch (err) {
         const message = errMessage(err);
-        current.lastError = message;
-        status.lastError = { at: Date.now(), message: `${target.source}: ${message}` };
-        console.error(`[poller] ${target.source} scan failed: ${message}`);
+        const msgLower = message.toLowerCase();
+        
+        if (
+          current.cursor &&
+          msgLower.includes("cursor") &&
+          (msgLower.includes("old") || msgLower.includes("retention") || msgLower.includes("bound") || msgLower.includes("invalid") || msgLower.includes("found") || msgLower.includes("startledger"))
+        ) {
+          console.warn(`[poller] ${target.source} cursor ${current.cursor} seems stale (${message}), resetting for next cycle`);
+          current.cursor = null;
+          current.lastError = `Stale cursor reset: ${message}`;
+        } else {
+          current.lastError = message;
+          status.lastError = { at: Date.now(), message: `${target.source}: ${message}` };
+          console.error(`[poller] ${target.source} scan failed: ${message}`);
+        }
+
+        const retryAfterMs = extractRetryAfterMs(err);
+        if (retryAfterMs !== null) {
+          console.warn(`[poller] RPC requested backoff for ${retryAfterMs}ms`);
+          explicitBackoff = retryAfterMs;
+          break; // Stop scanning other targets, they will likely hit the same limit
+        }
       }
     }
 
@@ -309,12 +370,18 @@ export function createPoller(deps: PollerDeps) {
     status.targets = [...state.values()].map((t) => ({ ...t }));
     await saveCursors();
     inFlight = false;
+    
+    if (explicitBackoff !== null) return explicitBackoff;
   }
 
   async function loop(): Promise<void> {
     if (stopped) return;
+    let nextDelay = config.pollIntervalMs;
     try {
-      await cycle();
+      const delay = await cycle();
+      if (typeof delay === "number" && delay > nextDelay) {
+        nextDelay = delay;
+      }
     } catch (err) {
       // Belt and braces: `cycle` already swallows per-target failures, so this
       // only fires on a bug. Either way the loop survives it.
@@ -324,7 +391,7 @@ export function createPoller(deps: PollerDeps) {
       inFlight = false;
     }
     if (stopped) return;
-    timer = setTimeout(() => void loop(), config.pollIntervalMs);
+    timer = setTimeout(() => void loop(), nextDelay);
   }
 
   return {
