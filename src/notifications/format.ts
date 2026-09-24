@@ -43,8 +43,9 @@ function clip(text: string, max = 200): string {
 
 function footer(config: StellarConfig, event: DecodedEvent): string {
   const ledger = escapeMd(`ledger ${event.ledger}`);
-  if (!event.txHash) return `_${ledger}_`;
-  return `_${ledger}_ · [tx](${txExplorerUrl(config, event.txHash)})`;
+  const version = escapeMd("v1");
+  if (!event.txHash) return `_${ledger}_ \\· _${version}_`;
+  return `_${ledger}_ \\· [tx](${txExplorerUrl(config, event.txHash)}) \\· _${version}_`;
 }
 
 /**

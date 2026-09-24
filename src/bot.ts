@@ -98,10 +98,21 @@ export function createBot(deps: BotDeps): Bot {
 /** The poller's send path: one message to the configured chat. */
 export function createNotifier(bot: Bot, config: BotConfig) {
   return async (text: string): Promise<void> => {
-    await bot.api.sendMessage(config.chatId, text, {
-      parse_mode: "MarkdownV2",
-      link_preview_options: { is_disabled: true },
-    });
+    try {
+      await bot.api.sendMessage(config.chatId, text, {
+        parse_mode: "MarkdownV2",
+        link_preview_options: { is_disabled: true },
+      });
+    } catch (err: any) {
+      if (err.description && err.description.includes("can't parse entities")) {
+        console.error(`[bot] MarkdownV2 parse failed: ${err.description}. Falling back to unformatted text.`);
+        await bot.api.sendMessage(config.chatId, text, {
+          link_preview_options: { is_disabled: true },
+        });
+        return;
+      }
+      throw err;
+    }
   };
 }
 

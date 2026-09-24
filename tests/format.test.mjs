@@ -137,7 +137,7 @@ test("formatted untrusted event text reaches Telegram as exact MarkdownV2", asyn
   const message = formatEvent(config, event);
   const expectedMessage =
     `🆕 *New claim* \\#7\nCategory: ${expectedEscape(reserved)}\n` +
-    "Creator: `GABCD`\n_ledger 42_";
+    "Creator: `GABCD`\n_ledger 42_ \\· _v1_";
   const sent = [];
   const fakeBot = {
     api: {
@@ -167,6 +167,33 @@ test("createNotifier preserves Telegram send failures for the poller", async () 
   const fakeBot = { api: { sendMessage: async () => Promise.reject(error) } };
   const notify = createNotifier(fakeBot, { chatId: "-1001234567890" });
   await assert.rejects(notify("message"), error);
+});
+
+test("createNotifier falls back to unformatted text if MarkdownV2 is rejected", async () => {
+  const error = new Error("Bad Request: can't parse entities");
+  error.description = "Bad Request: can't parse entities: Character '.' is reserved and must be escaped with the preceding '\\'";
+  
+  const sent = [];
+  const fakeBot = { 
+    api: { 
+      sendMessage: async (...args) => {
+        if (args[2]?.parse_mode === "MarkdownV2") {
+          return Promise.reject(error);
+        }
+        sent.push(args);
+        return {};
+      }
+    }
+  };
+  
+  const notify = createNotifier(fakeBot, { chatId: "-1001234567890" });
+  await notify("malformed * text");
+  
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0][0], "-1001234567890");
+  assert.equal(sent[0][1], "malformed * text");
+  assert.equal(sent[0][2].parse_mode, undefined);
+  assert.equal(sent[0][2].link_preview_options.is_disabled, true);
 });
 
 test("escapeMd handles a long adversarial string without dropping characters", () => {
