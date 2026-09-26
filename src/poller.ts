@@ -13,9 +13,10 @@
  *    would turn a broken token or chat into an infinite replay, and recovery
  *    would flood the channel. Notifications are lossy by design; the chain
  *    remains the record.
- *  - A cursor file that cannot be read is treated as a cold start; one that
- *    cannot be written is logged, and the in-memory cursor keeps working until
- *    the next restart.
+ *  - A cursor file that cannot be read or fails schema validation is
+ *    quarantined beside the live path (`*.corrupt.<timestamp>`) and treated as
+ *    a cold start; one that cannot be written is logged, and the in-memory
+ *    cursor keeps working until the next restart.
  *  - A graceful shutdown (`poller.shutdown()`) stops scheduling, drops the
  *    notifications that have not been sent yet, waits a bounded time for the
  *    in-flight cycle, and flushes cursors that are still only in memory. The
@@ -112,7 +113,7 @@ export interface PollerStatus {
   };
 }
 
-interface CursorFile {
+export interface CursorFile {
   version: 1;
   updatedAt: string;
   /**
@@ -163,56 +164,6 @@ function parseChainClock(value: unknown): number | null {
   if (value === null || value === undefined) return null;
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) return null;
   return isPlausibleChainClock(value) ? value : null;
-}
-
-function parseCursorFile(raw: string): CursorFile {
-  const parsed: unknown = JSON.parse(raw);
-  if (typeof parsed !== "object" || parsed === null) {
-    throw new Error("cursor root must be an object");
-  }
-
-  const candidate = parsed as Partial<CursorFile>;
-  if (candidate.version !== 1 || typeof candidate.targets !== "object" || candidate.targets === null) {
-    throw new Error("unsupported cursor format; expected version 1");
-  }
-
-  const targets: Record<string, CursorTarget> = {};
-  for (const [source, value] of Object.entries(candidate.targets)) {
-    if (typeof value !== "object" || value === null) {
-      throw new Error(`invalid cursor target ${source}`);
-    }
-    const target = value as Partial<CursorTarget>;
-    if (
-      target.cursor !== null &&
-      (typeof target.cursor !== "string" || target.cursor.length === 0 || target.cursor.length > 256)
-    ) {
-      throw new Error(`invalid cursor value for ${source}`);
-    }
-    if (
-      target.lastEventLedger !== null &&
-      (typeof target.lastEventLedger !== "number" ||
-        !Number.isSafeInteger(target.lastEventLedger) ||
-        target.lastEventLedger < 0)
-    ) {
-      throw new Error(`invalid last event ledger for ${source}`);
-    }
-    targets[source] = {
-      cursor: target.cursor ?? null,
-      lastEventLedger: target.lastEventLedger ?? null,
-      // The dedup window is part of the cursor file: a restart must not
-      // re-notify the boundary event the inclusive cursor hands back.
-      recentEventIds: Array.isArray(target.recentEventIds)
-        ? target.recentEventIds.filter((id) => typeof id === "string")
-        : [],
-    };
-  }
-
-  return {
-    version: 1,
-    updatedAt: String(candidate.updatedAt ?? ""),
-    chainClockAt: parseChainClock(candidate.chainClockAt),
-    targets,
-  };
 }
 
 /** Tuning knobs for Telegram delivery; defaults suit production, tests shrink them. */
@@ -302,6 +253,115 @@ function withinDeadline(promise: Promise<void>, timeoutMs: number): Promise<bool
     };
     void promise.then(settled, settled);
   });
+}
+
+
+/** Stable quarantine path next to the live cursor file (never overwrites). */
+export function cursorQuarantinePath(cursorFile: string, at: Date = new Date()): string {
+  const stamp = at.toISOString().replace(/[:.]/g, "-");
+  return `${cursorFile}.corrupt.${stamp}`;
+}
+
+function isNullOrString(value: unknown): value is string | null {
+  return value === null || typeof value === "string";
+}
+
+function isNullOrNumber(value: unknown): value is number | null {
+  return value === null || (typeof value === "number" && Number.isFinite(value));
+}
+
+/**
+ * Strict schema check for persisted cursor state.
+ * Valid JSON with the wrong shape is treated as corrupt so we never resume
+ * from a half-understood file.
+ */
+export function isValidCursorFile(value: unknown): value is CursorFile {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const obj = value as Record<string, unknown>;
+  if (obj.version !== 1) return false;
+  if (obj.updatedAt !== undefined && typeof obj.updatedAt !== "string") return false;
+  if (obj.targets === null || typeof obj.targets !== "object" || Array.isArray(obj.targets)) {
+    return false;
+  }
+  for (const entry of Object.values(obj.targets as Record<string, unknown>)) {
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) return false;
+    const saved = entry as Record<string, unknown>;
+    if (!isNullOrString(saved.cursor)) return false;
+    if (!isNullOrNumber(saved.lastEventLedger)) return false;
+  }
+  return true;
+}
+
+/** Parse + validate a cursor file body; throws on JSON or schema failure. */
+export function parseCursorFile(raw: string): CursorFile {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw) as unknown;
+  } catch (err) {
+    throw new Error(`invalid JSON: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (!isValidCursorFile(parsed)) {
+    throw new Error("failed schema validation (expected version 1 with targets map)");
+  }
+
+  const targets: Record<string, CursorTarget> = {};
+  for (const [source, target] of Object.entries(parsed.targets)) {
+    if (
+      target.cursor !== null &&
+      (target.cursor.length === 0 || target.cursor.length > 256)
+    ) {
+      throw new Error(`invalid cursor value for ${source}`);
+    }
+    if (
+      target.lastEventLedger !== null &&
+      (!Number.isSafeInteger(target.lastEventLedger) || target.lastEventLedger < 0)
+    ) {
+      throw new Error(`invalid last event ledger for ${source}`);
+    }
+    targets[source] = {
+      cursor: target.cursor,
+      lastEventLedger: target.lastEventLedger,
+      // The dedup window is part of the cursor file: a restart must not
+      // re-notify the boundary event the inclusive cursor hands back.
+      // Additive field: only present when the file carried it.
+      ...(Array.isArray(target.recentEventIds)
+        ? { recentEventIds: target.recentEventIds.filter((id) => typeof id === "string") }
+        : {}),
+    };
+  }
+
+  return {
+    version: 1,
+    updatedAt: parsed.updatedAt ?? "",
+    // Additive field: only present when the file carried it.
+    ...(parsed.chainClockAt !== undefined ? { chainClockAt: parseChainClock(parsed.chainClockAt) } : {}),
+    targets,
+  };
+}
+
+/**
+ * Move a corrupt cursor file aside so the next save starts clean and operators
+ * can inspect the bad file. Returns the quarantine path, or null if rename failed.
+ */
+export async function quarantineCorruptCursorFile(
+  cursorFile: string,
+  reason: string,
+  at: Date = new Date(),
+): Promise<string | null> {
+  const dest = cursorQuarantinePath(cursorFile, at);
+  try {
+    await rename(cursorFile, dest);
+    console.warn(
+      `[poller] cursor file unreadable, starting cold: quarantined it to ${dest} (${reason})`,
+    );
+    return dest;
+  } catch (err) {
+    console.warn(
+      `[poller] cursor file unreadable, starting cold: could not quarantine ${cursorFile}: ` +
+        `${safeErrorMessage(err, [])}; the file was left in place (${reason})`,
+    );
+    return null;
+  }
 }
 
 
@@ -509,8 +569,10 @@ export function createPoller(deps: PollerDeps) {
             .join(" "),
       );
     } catch (err) {
-      // A corrupt state file must not wedge the bot; a cold start is recoverable.
-      console.warn(`[poller] cursor file unreadable, starting cold: ${errorMessage(err)}`);
+      // Quarantine then cold-start: never wedge on a corrupt state file, and
+      // keep the bad bytes for operators instead of overwriting them on save.
+      const reason = errorMessage(err);
+      await quarantineCorruptCursorFile(config.cursorFile, reason);
     }
   }
 

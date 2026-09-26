@@ -337,3 +337,20 @@ npm run scan
 ```
 
 The notifier should remain read-only throughout incident recovery. The chain remains the source of truth even when Telegram delivery is unavailable.
+
+## Corrupt cursor file
+
+### Symptoms
+
+* Startup logs show a quarantined cursor path (`*.corrupt.<timestamp>`).
+* `/status` shows null/cold cursors after a restart that previously had resume positions.
+* A brief lookback replay of recent events may appear in the chat (bounded by `START_LOOKBACK_LEDGERS`).
+
+### Recovery
+
+1. Confirm the live `CURSOR_FILE` path (default `data/cursor.json`) was removed or renamed.
+2. Inspect the quarantined sibling file for truncation or unexpected shape — do not paste bot tokens or secrets into tickets.
+3. Leave the quarantine file in place for forensics; the poller will write a fresh cursor on the next successful cycle.
+4. Do not manually invent cursor strings. If you must force a lookback window, delete only the live cursor file and restart (or rely on the automatic quarantine path).
+
+The chain remains the source of truth; quarantining never signs transactions or skips retained events beyond the configured lookback.
