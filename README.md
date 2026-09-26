@@ -313,7 +313,8 @@ values are supported without changing cursor or decoder compatibility.
 ## Cursor persistence
 
 The poller writes its resume position to `data/cursor.json` (write-then-rename,
-so a crash mid-write cannot truncate it):
+so a crash mid-write cannot truncate it). The on-disk document is a **versioned
+schema** (`version: 1` today):
 
 ```json
 {
@@ -341,12 +342,24 @@ cursor files without the field load as an empty window. The `version` and the
 `cursor` / `lastEventLedger` fields are unchanged, so the format stays
 backward-compatible in both directions.
 
-On a cold start (no file) it begins `START_LOOKBACK_LEDGERS` behind the chain tip
-rather than replaying the whole retained window into your chat. `/pause` and
-`/resume` never edit this file; they only control scheduling, so the cursor
-format remains version 1 and a restart does not preserve a pause. A graceful
-shutdown flushes any cursor state that is still only in memory before the
-process exits — see [Graceful shutdown](#graceful-shutdown).
+**Compatibility / migration**
+
+- Current files (`version: 1`) load as-is.
+- Legacy unversioned envelopes (`{ "targets": … }` without `version`) and flat
+  maps (`{ "market": { "cursor": … }, "squad": … }` or string cursors) are
+  migrated in-place to schema v1 on startup, then rewritten atomically.
+- Unknown future `version` values are rejected: the file is quarantined and the
+  bot cold-starts rather than guessing, so a downgrade cannot mis-read a newer
+  file. Upgrade the bot before rolling forward again.
+- Corrupt JSON or unrecognised shapes are also quarantined and cold-started (see
+  failure behaviour below). Logs never include the raw file body.
+
+On a cold start (no usable file) it begins `START_LOOKBACK_LEDGERS` behind the
+chain tip rather than replaying the whole retained window into your chat.
+`/pause` and `/resume` never edit this file; they only control scheduling, so the
+cursor format remains version 1 and a restart does not preserve a pause. A
+graceful shutdown flushes any cursor state that is still only in memory before
+the process exits — see [Graceful shutdown](#graceful-shutdown).
 
 Tests never use this directory: they run against an ephemeral data directory
 created under the OS temp dir and removed afterwards (see

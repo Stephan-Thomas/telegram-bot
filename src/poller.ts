@@ -17,6 +17,9 @@
  *    quarantined beside the live path (`*.corrupt.<timestamp>`) and treated as
  *    a cold start; one that cannot be written is logged, and the in-memory
  *    cursor keeps working until the next restart.
+ *  - Legacy (unversioned / flat) cursor files are migrated in-place to the
+ *    current versioned schema on load; unknown future versions are rejected
+ *    so a downgrade cannot silently mis-read a newer file.
  *  - A second process that tries to start against the same lock file is refused
  *    up front. Concurrent instances would race the cursor and double-notify.
  *  - A graceful shutdown (`poller.shutdown()`) stops scheduling, drops the
@@ -124,8 +127,11 @@ export interface PollerStatus {
   };
 }
 
+/** Current on-disk cursor schema. Bump when the shape of `targets` changes. */
+export const CURSOR_SCHEMA_VERSION = 1 as const;
+
 export interface CursorFile {
-  version: 1;
+  version: typeof CURSOR_SCHEMA_VERSION;
   updatedAt: string;
   /**
    * Newest observed chain close time (unix ms). Optional and additive: files
@@ -145,6 +151,22 @@ interface CursorTarget {
    * because the window never grows past `EVENT_DEDUP_WINDOW`.
    */
   recentEventIds?: string[];
+}
+
+export type CursorTargetEntry = CursorTarget;
+
+/** Where a loaded cursor document came from before normalisation. */
+export type CursorSchemaSource =
+  | "v1"
+  | "legacy-unversioned"
+  | "legacy-flat"
+  | "legacy-string-map";
+
+export interface CursorMigrateResult {
+  file: CursorFile;
+  /** True when the on-disk document was rewritten into the current schema. */
+  migrated: boolean;
+  source: CursorSchemaSource;
 }
 
 /**
@@ -376,6 +398,177 @@ export async function quarantineCorruptCursorFile(
 }
 
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function normalizeTargetEntry(value: unknown, label: string): CursorTargetEntry {
+  if (typeof value === "string") {
+    return { cursor: value.length > 0 ? value : null, lastEventLedger: null };
+  }
+  if (!isPlainObject(value)) {
+    throw new Error(`${label}: target entry must be an object or cursor string`);
+  }
+
+  let cursor: string | null = null;
+  if (value.cursor === null || value.cursor === undefined) {
+    cursor = null;
+  } else if (typeof value.cursor === "string") {
+    if (value.cursor.length > 256) throw new Error(`${label}: cursor is implausibly long`);
+    cursor = value.cursor.length > 0 ? value.cursor : null;
+  } else {
+    throw new Error(`${label}: cursor must be a string or null`);
+  }
+
+  let lastEventLedger: number | null = null;
+  if (value.lastEventLedger === null || value.lastEventLedger === undefined) {
+    lastEventLedger = null;
+  } else if (
+    typeof value.lastEventLedger === "number" &&
+    Number.isSafeInteger(value.lastEventLedger) &&
+    value.lastEventLedger >= 0
+  ) {
+    lastEventLedger = value.lastEventLedger;
+  } else {
+    throw new Error(`${label}: lastEventLedger must be an integer or null (non-negative)`);
+  }
+
+  // The dedup window is additive: carried through only when the file had it.
+  const recent = value.recentEventIds;
+  return Array.isArray(recent)
+    ? {
+        cursor,
+        lastEventLedger,
+        recentEventIds: recent.filter((id): id is string => typeof id === "string"),
+      }
+    : { cursor, lastEventLedger };
+}
+
+function normalizeTargets(
+  targets: Record<string, unknown>,
+  label: string,
+): Record<string, CursorTargetEntry> {
+  const out: Record<string, CursorTargetEntry> = {};
+  for (const [source, saved] of Object.entries(targets)) {
+    out[source] = normalizeTargetEntry(saved, `${label}.targets.${source}`);
+  }
+  return out;
+}
+
+/**
+ * Detect whether a top-level object looks like a flat legacy cursor map
+ * (`{ market: { cursor, lastEventLedger }, squad: ... }` or string values)
+ * rather than the versioned `{ version, targets }` envelope.
+ */
+function looksLikeFlatLegacyTargets(parsed: Record<string, unknown>): boolean {
+  if ("targets" in parsed || "version" in parsed) return false;
+  const keys = Object.keys(parsed);
+  if (keys.length === 0) return false;
+  // Ignore purely metadata-looking keys if somehow present alone.
+  const dataKeys = keys.filter((k) => k !== "updatedAt");
+  if (dataKeys.length === 0) return false;
+  return dataKeys.every((key) => {
+    const value = parsed[key];
+    return typeof value === "string" || isPlainObject(value);
+  });
+}
+
+/**
+ * Parse a cursor file document and migrate any supported legacy shape into the
+ * current versioned schema. Throws on malformed JSON payloads or unknown
+ * future schema versions (the caller quarantines the file and cold-starts).
+ */
+export function parseAndMigrateCursorFile(
+  raw: string,
+  options: { now?: () => Date } = {},
+): CursorMigrateResult {
+  const parsedUnknown: unknown = JSON.parse(raw);
+  if (!isPlainObject(parsedUnknown)) {
+    throw new Error("cursor file root must be a JSON object");
+  }
+  const parsed = parsedUnknown;
+  const nowIso = (options.now ?? (() => new Date()))().toISOString();
+
+  // ── Current versioned schema ───────────────────────────────────────────────
+  if (parsed.version === CURSOR_SCHEMA_VERSION) {
+    if (!isPlainObject(parsed.targets)) {
+      throw new Error("cursor file v1: targets field missing or not an object");
+    }
+    const targets = normalizeTargets(parsed.targets, "cursor file v1");
+    const updatedAt =
+      typeof parsed.updatedAt === "string" && parsed.updatedAt.length > 0
+        ? parsed.updatedAt
+        : nowIso;
+    const file: CursorFile = { version: CURSOR_SCHEMA_VERSION, updatedAt, targets };
+    if (parsed.chainClockAt !== undefined) file.chainClockAt = parseChainClock(parsed.chainClockAt);
+    return {
+      file,
+      migrated: typeof parsed.updatedAt !== "string" || parsed.updatedAt.length === 0,
+      source: "v1",
+    };
+  }
+
+  // ── Unknown future / invalid version ─────────────────────────────────────
+  if ("version" in parsed && parsed.version !== undefined && parsed.version !== null) {
+    throw new Error(
+      `cursor file: unsupported schema version ${String(parsed.version)} ` +
+        `(this build understands version ${CURSOR_SCHEMA_VERSION})`,
+    );
+  }
+
+  // ── Legacy: unversioned envelope with `targets` ────────────────────────────
+  if (isPlainObject(parsed.targets)) {
+    const targets = normalizeTargets(parsed.targets, "legacy-unversioned");
+    return {
+      file: { version: CURSOR_SCHEMA_VERSION, updatedAt: nowIso, targets },
+      migrated: true,
+      source: "legacy-unversioned",
+    };
+  }
+
+  // ── Legacy: flat map of target → entry or cursor string ────────────────────
+  if (looksLikeFlatLegacyTargets(parsed)) {
+    const { updatedAt: _ignored, ...flat } = parsed;
+    const allStrings = Object.values(flat).every((v) => typeof v === "string");
+    const targets = normalizeTargets(flat, allStrings ? "legacy-string-map" : "legacy-flat");
+    return {
+      file: { version: CURSOR_SCHEMA_VERSION, updatedAt: nowIso, targets },
+      migrated: true,
+      source: allStrings ? "legacy-string-map" : "legacy-flat",
+    };
+  }
+
+  throw new Error("cursor file: unrecognised shape (expected versioned targets map)");
+}
+
+/** Build the on-disk payload the poller always writes. */
+export function buildCursorFile(
+  targets: Iterable<{
+    source: string;
+    cursor: string | null;
+    lastEventLedger: number | null;
+    recentEventIds?: string[];
+  }>,
+  updatedAt: string,
+  chainClockAt?: number | null,
+): CursorFile {
+  return {
+    version: CURSOR_SCHEMA_VERSION,
+    updatedAt,
+    ...(chainClockAt !== undefined ? { chainClockAt } : {}),
+    targets: Object.fromEntries(
+      [...targets].map((t) => [
+        t.source,
+        {
+          cursor: t.cursor,
+          lastEventLedger: t.lastEventLedger,
+          ...(t.recentEventIds !== undefined ? { recentEventIds: t.recentEventIds } : {}),
+        } satisfies CursorTarget,
+      ]),
+    ),
+  };
+}
+
 /** Timeout for each RPC scan request */
 const SCAN_TIMEOUT_MS = 15_000;
 
@@ -527,6 +720,8 @@ export function createPoller(deps: PollerDeps) {
   let inFlight = false;
   let resumePending = false;
   let instanceLock: InstanceLockHandle | null = null;
+  /** Set when load migrates a legacy file so the first save rewrites disk ASAP. */
+  let pendingRewrite = false;
 
   async function releaseInstanceLock(): Promise<void> {
     const lock = instanceLock;
@@ -568,8 +763,9 @@ export function createPoller(deps: PollerDeps) {
     }
 
     try {
-      const parsed = parseCursorFile(raw);
-      for (const [source, saved] of Object.entries(parsed.targets ?? {})) {
+      const result = parseAndMigrateCursorFile(raw, { now: () => new Date(now()) });
+      const parsed = result.file;
+      for (const [source, saved] of Object.entries(parsed.targets)) {
         const key = source as ContractSource;
         const target = state.get(key);
         if (!target) continue;
@@ -579,8 +775,17 @@ export function createPoller(deps: PollerDeps) {
         // re-notify the last event the inclusive cursor hands back.
         dedup.set(key, EventDedupWindow.fromJSON(saved.recentEventIds, config.dedupWindow));
       }
-      // Memory now equals the file; nothing is waiting to be flushed.
+      // Memory now equals the file; nothing is waiting to be flushed — unless
+      // the file was a legacy shape, which start() rewrites before any cycle.
       status.pendingFlush = false;
+      if (result.migrated) {
+        pendingRewrite = true;
+        markDirty();
+        console.log(
+          `[poller] migrated cursor file from ${result.source} → ` +
+            `schema v${CURSOR_SCHEMA_VERSION} at ${config.cursorFile}`,
+        );
+      }
       // Resume the chain clock alongside the cursors. Without this a restart
       // between two quiet scans would report `unknown` until the next event
       // happened to land, hiding a perfectly healthy (or long-stalled) chain.
@@ -608,22 +813,17 @@ export function createPoller(deps: PollerDeps) {
     status.pendingFlush = true;
   }
 
-  async function saveCursors(reason: "cycle" | "shutdown"): Promise<boolean> {
-    const payload: CursorFile = {
-      version: 1,
-      updatedAt: new Date(now()).toISOString(),
-      chainClockAt: status.chainClockAt,
-      targets: Object.fromEntries(
-        [...state.values()].map((t) => [
-          t.source,
-          {
-            cursor: t.cursor,
-            lastEventLedger: t.lastEventLedger,
-            recentEventIds: dedup.get(t.source)?.toJSON() ?? [],
-          } satisfies CursorTarget,
-        ]),
-      ),
-    };
+  async function saveCursors(reason: "cycle" | "shutdown" | "migration"): Promise<boolean> {
+    const payload = buildCursorFile(
+      [...state.values()].map((t) => ({
+        source: t.source,
+        cursor: t.cursor,
+        lastEventLedger: t.lastEventLedger,
+        recentEventIds: dedup.get(t.source)?.toJSON() ?? [],
+      })),
+      new Date(now()).toISOString(),
+      status.chainClockAt,
+    );
 
     try {
       await mkdir(path.dirname(config.cursorFile), { recursive: true });
@@ -634,6 +834,7 @@ export function createPoller(deps: PollerDeps) {
       await rename(tmp, config.cursorFile);
       status.pendingFlush = false;
       status.lastFlushAt = now();
+      pendingRewrite = false;
       return true;
     } catch (err) {
       // `pendingFlush` is deliberately left as it was: if state was ahead of
@@ -1008,6 +1209,12 @@ export function createPoller(deps: PollerDeps) {
       paused = false;
       status.paused = false;
       status.stopping = false;
+
+      // Persist a migrated schema before the first cycle so a crash mid-poll
+      // still leaves a versioned file behind for the next restart.
+      if (pendingRewrite) {
+        await saveCursors("migration");
+      }
       status.running = true;
       status.startedAt = now();
       status.targets = [...state.values()].map((t) => ({ ...t }));
