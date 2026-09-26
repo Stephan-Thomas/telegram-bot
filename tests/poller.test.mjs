@@ -795,7 +795,8 @@ const CREATOR = Keypair.fromRawEd25519Seed(Buffer.alloc(32, 7)).publicKey();
 /** Raw contract event that decodes to a notifiable `claim_created`. */
 function claimCreatedEvent(claimId) {
   return {
-    id: `${SHUT_TIP}-0`,
+    // Unique paging token per claim so scan-level dedupe keeps each event.
+    id: `${SHUT_TIP}-${claimId}`,
     contractId: MARKET_ID,
     ledger: SHUT_TIP,
     txHash: "ab".repeat(32),

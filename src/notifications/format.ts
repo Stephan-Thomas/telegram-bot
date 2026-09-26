@@ -13,6 +13,7 @@
 import { txExplorerUrl } from "../stellar/client.js";
 import {
   formatUsdc,
+  isUsableTxHash,
   shortAddress,
   squadSideLabel,
   winnerSideLabel,
@@ -92,8 +93,11 @@ function clip(text: string, max = MAX_EVENT_FIELD_LENGTH): string {
 
 function footer(config: StellarConfig, event: DecodedEvent): string {
   const ledger = escapeMd(`ledger ${event.ledger}`);
-  if (!event.txHash || event.txHash.length > MAX_TX_HASH_LENGTH) return `_${ledger}_`;
-  return `_${ledger}_ · [tx](${txExplorerUrl(config, event.txHash)})`;
+  // Link only well-formed 64-hex transaction hashes. An externally-derived
+  // identifier that is empty, oversized or malformed stays plain text: a broken
+  // explorer link is worse than no link, and the hash itself is never altered here.
+  if (event.txHash.length > MAX_TX_HASH_LENGTH || !isUsableTxHash(event.txHash)) return `_${ledger}_`;
+  return `_${ledger}_ · [tx](${txExplorerUrl(config, event.txHash.trim())})`;
 }
 
 /**
@@ -251,9 +255,13 @@ export function previewMessage(config: StellarConfig, target = "market"): string
       source: "squad",
       contractId: config.squadContractId,
       ledger: 1000000,
-      txHash: "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+      txHash: "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
       at: Math.floor(Date.now() / 1000),
       eventId: "1000000-1",
+      eventType: "contract",
+      transactionIndex: 0,
+      operationIndex: 0,
+      inSuccessfulContractCall: true,
       payload: {
         name: "market_created",
         marketId: 1,
@@ -271,9 +279,13 @@ export function previewMessage(config: StellarConfig, target = "market"): string
     source: "market",
     contractId: config.marketContractId,
     ledger: 1000000,
-    txHash: "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+    txHash: "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
     at: Math.floor(Date.now() / 1000),
     eventId: "1000000-0",
+    eventType: "contract",
+    transactionIndex: 0,
+    operationIndex: 0,
+    inSuccessfulContractCall: true,
     payload: {
       name: "claim_created",
       claimId: 1,

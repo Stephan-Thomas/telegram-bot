@@ -57,6 +57,27 @@ export interface EventMeta {
   at: number;
   /** The RPC's own event id — unique and monotonic, handy for logs. */
   eventId: string;
+  /**
+   * Preserved ordering metadata (issue #48).
+   *
+   * Soroban RPC's `getEvents` returns each event with `ledger`,
+   * `transactionIndex`, `operationIndex`, `txHash` and an opaque paging-token
+   * `id` (`<TOID>-<order>`). All of it is carried here so events from the same
+   * or different ledgers/transactions can be ordered deterministically without
+   * relying on array order, arrival order, or local timestamps.
+   *
+   * `transactionIndex` / `operationIndex` are `null` when the chain response
+   * does not provide them — never invented. Sorting treats `null` as
+   * "unknown, order after known positions" and falls back to the paging token.
+   */
+  /** RPC `type` (`"contract"` | `"system"` | `"diagnostic"`), else `"unknown"`. */
+  eventType: string;
+  /** Position of the transaction inside its ledger, when the RPC provides it. */
+  transactionIndex: number | null;
+  /** Position of the operation inside its transaction, when provided. */
+  operationIndex: number | null;
+  /** Whether the emitting call succeeded, when the RPC provides it. */
+  inSuccessfulContractCall: boolean | null;
 }
 
 export type MarketPayload =
@@ -450,8 +471,22 @@ function contractIdOf(event: rpc.Api.EventResponse): string {
   if (typeof raw === "string") return raw;
   if (raw && typeof raw === "object") {
     const maybe = raw as { contractId?: () => string; toString?: () => string };
-    if (typeof maybe.contractId === "function") return maybe.contractId();
-    if (typeof maybe.toString === "function") return maybe.toString();
+    if (typeof maybe.contractId === "function") {
+      try {
+        return maybe.contractId();
+      } catch {
+        return "";
+      }
+    }
+    if (typeof maybe.toString === "function") {
+      try {
+        const text = maybe.toString();
+        // A default `[object Object]` string is not a contract id.
+        if (typeof text === "string" && text !== "[object Object]") return text;
+      } catch {
+        // Fall through to "".
+      }
+    }
   }
   return "";
 }
@@ -460,18 +495,14 @@ function contractIdOf(event: rpc.Api.EventResponse): string {
  * Decode one RPC event.
  *
  * Never throws: an event this bot does not understand — a new contract event, a
- * shape change, a field it cannot read — becomes an `unknown` payload with the
- * reason attached. A notifier must not die on an event it was not taught.
+ * shape change, malformed XDR, or missing ordering metadata — becomes an
+ * `unknown` payload with the reason attached. A notifier must not die on an
+ * event it was not taught. Malformed metadata falls back to safe defaults
+ * (`ledger` 0, indexes `null`, `at` 0) rather than `NaN`, so a poisoned field
+ * can neither crash the scanner nor corrupt ordering math.
  */
 export function decodeEvent(source: ContractSource, event: rpc.Api.EventResponse): DecodedEvent {
-  const meta: EventMeta = {
-    source,
-    contractId: contractIdOf(event),
-    ledger: Number(event?.ledger ?? 0),
-    txHash: event?.txHash ?? "",
-    at: Math.floor(new Date(event?.ledgerClosedAt ?? 0).getTime() / 1000),
-    eventId: event?.id ?? "",
-  };
+  const meta: EventMeta = safeMeta(source, event);
 
   let eventName = "";
   try {
@@ -482,7 +513,7 @@ export function decodeEvent(source: ContractSource, event: rpc.Api.EventResponse
     const rawTopics = Array.isArray(event.topic) ? event.topic : [];
     const topics = rawTopics.map((t) => {
       try {
-        return native(t);
+        return native(t as xdr.ScVal);
       } catch {
         return null;
       }
@@ -521,6 +552,163 @@ export function decodeEvent(source: ContractSource, event: rpc.Api.EventResponse
       },
     };
   }
+}
+
+// ── Ordering metadata (issue #48) ────────────────────────────────────────────
+
+/** Ledger sequence: a finite non-negative integer, else 0. Never `NaN`. */
+function toLedger(value: unknown): number {
+  const n = typeof value === "string" && value.trim() !== "" ? Number(value) : value;
+  if (typeof n !== "number" || !Number.isFinite(n)) return 0;
+  const floored = Math.floor(n);
+  return floored >= 0 ? floored : 0;
+}
+
+/**
+ * Transaction/operation position: a non-negative integer when the RPC provides
+ * one (number or numeric string), else `null`. `null` means "the chain did not
+ * say" — sorting orders it after known positions instead of inventing one.
+ */
+function toPosition(value: unknown): number | null {
+  let n: number;
+  if (typeof value === "number") {
+    n = value;
+  } else if (typeof value === "string" && /^-?\d+$/.test(value.trim())) {
+    n = Number(value.trim());
+  } else {
+    return null;
+  }
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n < 0) return null;
+  return n;
+}
+
+/** Trimmed transaction hash, or `""` when absent. Kept verbatim, not dropped. */
+function toTxHash(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+/** RPC event `type`, or `"unknown"` when missing/unexpected. */
+function toEventType(value: unknown): string {
+  return value === "contract" || value === "system" || value === "diagnostic"
+    ? value
+    : "unknown";
+}
+
+function toSuccessFlag(value: unknown): boolean | null {
+  return typeof value === "boolean" ? value : null;
+}
+
+/** Unix seconds for `ledgerClosedAt`, or 0 when unparseable. Never `NaN`. */
+function toAt(value: unknown): number {
+  if (value === null || value === undefined || value === "") return 0;
+  const ms = new Date(value as string).getTime();
+  if (!Number.isFinite(ms)) return 0;
+  return Math.floor(ms / 1000);
+}
+
+/**
+ * Build the ordering-safe metadata for one RPC event. Never throws, even for
+ * `null`/partially-shaped input: every field is coerced with a safe default.
+ */
+function safeMeta(source: ContractSource, event: rpc.Api.EventResponse): EventMeta {
+  try {
+    const raw = (event ?? {}) as Partial<rpc.Api.EventResponse> & Record<string, unknown>;
+    const id = raw.id;
+    return {
+      source,
+      contractId: contractIdOf(event),
+      ledger: toLedger(raw.ledger),
+      txHash: toTxHash(raw.txHash),
+      at: toAt(raw.ledgerClosedAt),
+      eventId: typeof id === "string" ? id : "",
+      eventType: toEventType(raw.type),
+      transactionIndex: toPosition(raw.transactionIndex),
+      operationIndex: toPosition(raw.operationIndex),
+      inSuccessfulContractCall: toSuccessFlag(raw.inSuccessfulContractCall),
+    };
+  } catch {
+    return {
+      source,
+      contractId: "",
+      ledger: 0,
+      txHash: "",
+      at: 0,
+      eventId: "",
+      eventType: "unknown",
+      transactionIndex: null,
+      operationIndex: null,
+      inSuccessfulContractCall: null,
+    };
+  }
+}
+
+/**
+ * A transaction hash is usable for ordering display and explorer links only
+ * when it is a 64-character hex string (32-byte Stellar transaction hash).
+ * Anything else stays on the event but is never turned into a link.
+ */
+export function isUsableTxHash(txHash: string): boolean {
+  return /^[0-9a-fA-F]{64}$/.test((txHash ?? "").trim());
+}
+
+/** Rank a position for ordering: known indexes first (ascending), `null` last. */
+function rankPosition(value: number | null): number {
+  return value ?? Number.MAX_SAFE_INTEGER;
+}
+
+/**
+ * Deterministic ordering over chain-provided metadata only:
+ * ledger → transaction index → operation index → paging token → tx hash.
+ *
+ * Returns 0 only when every compared field is equal. No wall-clock time, no
+ * array position, and no JS object iteration order are consulted, so the same
+ * set of events always sorts the same way regardless of RPC page splits or
+ * poll-cycle boundaries.
+ */
+export function compareEvents(a: EventMeta, b: EventMeta): number {
+  if (a.ledger !== b.ledger) return a.ledger - b.ledger;
+  const txA = rankPosition(a.transactionIndex);
+  const txB = rankPosition(b.transactionIndex);
+  if (txA !== txB) return txA - txB;
+  const opA = rankPosition(a.operationIndex);
+  const opB = rankPosition(b.operationIndex);
+  if (opA !== opB) return opA - opB;
+  if (a.eventId !== b.eventId) return a.eventId < b.eventId ? -1 : 1;
+  if (a.txHash !== b.txHash) return a.txHash < b.txHash ? -1 : 1;
+  return 0;
+}
+
+/**
+ * A stable, deterministic sort. Returns a new array; the input is untouched.
+ * Elements with identical ordering keys keep their input relative order.
+ */
+export function sortEvents<T extends EventMeta>(events: readonly T[]): T[] {
+  return events
+    .map((event, index) => ({ event, index }))
+    .sort((x, y) => compareEvents(x.event, y.event) || x.index - y.index)
+    .map((entry) => entry.event);
+}
+
+/**
+ * Drop within-scan duplicates by paging token (`eventId`). The RPC may repeat
+ * the boundary event across pages; the first occurrence wins and input order
+ * is preserved. Events with no paging token cannot be identified and are all
+ * kept — identity is never invented.
+ */
+export function dedupeEvents<T extends EventMeta>(events: readonly T[]): T[] {
+  const seen = new Set<string>();
+  const out: T[] = [];
+  for (const event of events) {
+    const id = event.eventId;
+    if (!id) {
+      out.push(event);
+      continue;
+    }
+    if (seen.has(id)) continue;
+    seen.add(id);
+    out.push(event);
+  }
+  return out;
 }
 
 // ── Display helpers (shared by formatting and the CLI) ───────────────────────
