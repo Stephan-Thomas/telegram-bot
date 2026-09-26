@@ -10,6 +10,7 @@
 import { readFile } from "node:fs/promises";
 
 import { ConfigError, activeProfileName, loadConfig, networkLabel } from "./config.js";
+import { InstanceLockError } from "./instanceLock.js";
 import { createBot, createNotifier, registerCommands, type SendExtra } from "./bot.js";
 import { startHealthServer } from "./health.js";
 import { createPoller } from "./poller.js";
@@ -93,6 +94,7 @@ async function main(): Promise<void> {
   console.log(`[boot] market       ${config.marketContractId}`);
   console.log(`[boot] squad        ${config.squadContractId}`);
   console.log(`[boot] cursor file  ${config.cursorFile}`);
+  console.log(`[boot] lock file    ${config.lockFile}`);
   console.log(`[boot] shutdown     ${config.shutdownTimeoutMs}ms drain budget`);
   console.log(
     `[boot] operator      ${config.operatorTelegramUserId === null ? "disabled" : "configured"}`,
@@ -132,6 +134,10 @@ async function main(): Promise<void> {
 
   await registerCommands(bot);
 
+  // Lock first: refuse a second live instance before Telegram long-polling starts.
+  // That keeps a duplicate process from racing the cursor or fighting getUpdates.
+  await poller.start();
+
   // grammy's `start` resolves only when the bot stops, so it is not awaited.
   // It retries transient network trouble internally; a rejection here means the
   // token itself cannot authenticate, which no amount of waiting fixes.
@@ -144,10 +150,8 @@ async function main(): Promise<void> {
         `[fatal] telegram long-polling failed — check BOT_TOKEN: ` +
           safeErrorMessage(err, [config.botToken]),
       );
-      process.exit(1);
+      void poller.stop().finally(() => process.exit(1));
     });
-
-  await poller.start();
 
   let shuttingDown = false;
 
@@ -214,7 +218,7 @@ async function main(): Promise<void> {
 }
 
 main().catch((err: unknown) => {
-  if (err instanceof ConfigError) {
+  if (err instanceof ConfigError || err instanceof InstanceLockError) {
     console.error(`\n${err.message}\n`);
     process.exit(1);
   }

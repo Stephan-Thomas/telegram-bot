@@ -89,8 +89,7 @@ async function main(): Promise<void> {
 
   const shutdown = (signal: string): void => {
     console.log(`[dry-run] ${signal} received, stopping`);
-    poller.stop();
-    void Promise.allSettled([health.close(), mock.close()]).finally(() => process.exit(0));
+    void Promise.allSettled([poller.stop(), health.close(), mock.close()]).finally(() => process.exit(0));
   };
   process.once("SIGINT", () => shutdown("SIGINT"));
   process.once("SIGTERM", () => shutdown("SIGTERM"));

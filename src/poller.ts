@@ -17,6 +17,8 @@
  *    quarantined beside the live path (`*.corrupt.<timestamp>`) and treated as
  *    a cold start; one that cannot be written is logged, and the in-memory
  *    cursor keeps working until the next restart.
+ *  - A second process that tries to start against the same lock file is refused
+ *    up front. Concurrent instances would race the cursor and double-notify.
  *  - A graceful shutdown (`poller.shutdown()`) stops scheduling, drops the
  *    notifications that have not been sent yet, waits a bounded time for the
  *    in-flight cycle, and flushes cursors that are still only in memory. The
@@ -45,6 +47,11 @@ import type { rpc } from "@stellar/stellar-sdk";
 import type { SendExtra } from "./bot.js";
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, type BotConfig } from "./config.js";
 import { EventDedupWindow, eventKey } from "./dedup.js";
+import {
+  acquireInstanceLock,
+  InstanceLockError,
+  type InstanceLockHandle,
+} from "./instanceLock.js";
 import { explorerKeyboard, formatEvent, safeErrorMessage } from "./notifications/format.js";
 import { buildStatusSnapshot, writeStatusFile, type StatusSnapshot } from "./status.js";
 import { readContractEvents, type WatchTarget } from "./stellar/events.js";
@@ -100,6 +107,10 @@ export interface PollerStatus {
   eventsDeduplicated: number;
   consecutiveFailures: number;
   lastError: { at: number; message: string } | null;
+  /** Absolute path of the exclusive instance lock, or null before acquire. */
+  lockFile: string | null;
+  /** Pid recorded in the lock while this process holds it. */
+  lockPid: number | null;
   /** In-memory cursor state is newer than the persisted file. */
   pendingFlush: boolean;
   lastFlushAt: number | null;
@@ -497,6 +508,8 @@ export function createPoller(deps: PollerDeps) {
     eventsDeduplicated: 0,
     consecutiveFailures: 0,
     lastError: null,
+    lockFile: null,
+    lockPid: null,
     pendingFlush: false,
     lastFlushAt: null,
     targets: [],
@@ -513,6 +526,16 @@ export function createPoller(deps: PollerDeps) {
   let paused = false;
   let inFlight = false;
   let resumePending = false;
+  let instanceLock: InstanceLockHandle | null = null;
+
+  async function releaseInstanceLock(): Promise<void> {
+    const lock = instanceLock;
+    if (!lock) return;
+    instanceLock = null;
+    status.lockPid = null;
+    await lock.release();
+    console.log(`[poller] instance lock released`);
+  }
   /** Resolves when the current cycle (including its cursor write) is done. */
   let cycleSettled: Promise<void> | null = null;
   let settleCycle: (() => void) | null = null;
@@ -962,6 +985,24 @@ export function createPoller(deps: PollerDeps) {
 
   return {
     async start(): Promise<void> {
+      // Refuse a second live process before touching the cursor or Telegram.
+      // Configs built without a lock path keep it next to the cursor it guards.
+      const lockFile = config.lockFile ?? path.join(path.dirname(config.cursorFile), "poller.lock");
+      try {
+        instanceLock = await acquireInstanceLock(lockFile);
+        status.lockFile = instanceLock.path;
+        status.lockPid = instanceLock.payload.pid;
+        console.log(
+          `[poller] instance lock acquired pid=${instanceLock.payload.pid} file=${instanceLock.path}`,
+        );
+      } catch (err) {
+        // Only a live second instance is fatal. A lock that cannot be written
+        // (read-only or missing data dir) must not stop the notifier, matching
+        // how an unwritable cursor file is handled.
+        if (err instanceof InstanceLockError) throw err;
+        console.warn(`[poller] could not take instance lock at ${lockFile}: ${errorMessage(err)}`);
+      }
+
       await loadCursors();
       stopped = false;
       paused = false;
@@ -1004,8 +1045,12 @@ export function createPoller(deps: PollerDeps) {
       return "resumed";
     },
 
-    /** Immediate stop: no draining, no waiting. Prefer {@link shutdown}. */
-    stop(): void {
+    /**
+     * Immediate stop: no draining, no waiting on the cycle. Prefer
+     * {@link shutdown}. State changes happen synchronously; the returned
+     * promise only covers releasing the instance lock.
+     */
+    async stop(): Promise<void> {
       stopped = true;
       paused = false;
       status.paused = false;
@@ -1016,6 +1061,7 @@ export function createPoller(deps: PollerDeps) {
       // Best-effort: the process may be exiting, but a final snapshot that says
       // `running: false` is what tells a supervisor the stop was deliberate.
       void persistStatus();
+      await releaseInstanceLock();
     },
 
     /**
@@ -1075,6 +1121,7 @@ export function createPoller(deps: PollerDeps) {
 
       status.running = false;
       await persistStatus();
+      await releaseInstanceLock();
       return { drained, flushed, waitedMs: Math.max(0, now() - startedAt) };
     },
 
@@ -1088,5 +1135,7 @@ export function createPoller(deps: PollerDeps) {
     },
   };
 }
+
+export { InstanceLockError };
 
 export type Poller = ReturnType<typeof createPoller>;

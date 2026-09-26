@@ -215,7 +215,7 @@ function redeliveringServer(event) {
 
 async function withTempCursor(t) {
   const dir = await mkdtemp(path.join(tmpdir(), "mimir-dedup-"));
-  t.after(() => rm(dir, { recursive: true, force: true }));
+  t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }));
   return path.join(dir, "cursor.json");
 }
 
@@ -242,7 +242,7 @@ test("the poller notifies a redelivered event once and counts the duplicates", a
     assert.equal(sent.length, 1);
     assert.ok(status.eventsDeduplicated >= 1, "redelivery counted, not re-sent");
   } finally {
-    poller.stop();
+    await poller.stop();
   }
 
   const saved = JSON.parse(await readFile(cursorFile, "utf8"));
@@ -271,7 +271,7 @@ test("a restart restores the window and does not re-notify the boundary event", 
     await waitFor(() => first.status().notificationsSent >= 1);
     await waitFor(() => first.status().cycles >= 2); // cycle 1 has saved the cursor
   } finally {
-    first.stop();
+    await first.stop();
   }
   assert.equal(firstSent.length, 1);
 
@@ -290,7 +290,7 @@ test("a restart restores the window and does not re-notify the boundary event", 
     assert.deepEqual(secondSent, [], "restart must not replay the boundary event");
     assert.ok(second.status().eventsDeduplicated >= 1);
   } finally {
-    second.stop();
+    await second.stop();
   }
 });
 
@@ -315,6 +315,6 @@ test("a corrupt cursor file still cold-starts and notifies (dedup never wedges t
     await waitFor(() => poller.status().notificationsSent >= 1);
     assert.equal(sent.length, 1);
   } finally {
-    poller.stop();
+    await poller.stop();
   }
 });
