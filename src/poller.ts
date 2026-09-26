@@ -668,6 +668,7 @@ async function sendWithRetry(
       return;
     } catch (err) {
       attempt++;
+      const retryAfterMs = extractRetryAfterMs(err);
       if (attempt >= maxRetries || !shouldRetry()) {
         throw err; // Exhausted retries, or a shutdown made waiting pointless
       }
@@ -675,7 +676,7 @@ async function sendWithRetry(
       const delay = retryAfterMs !== null ? retryAfterMs : backoff;
       
       console.warn(
-        `[poller] send attempt ${attempt} failed, retrying in ${backoff}ms: ` +
+        `[poller] send attempt ${attempt} failed, retrying in ${delay}ms: ` +
           safeErrorMessage(err, [botToken]),
       );
       await sleep(delay);
@@ -1008,6 +1009,7 @@ export function createPoller(deps: PollerDeps) {
   async function cycle(): Promise<number | void> {
     if (inFlight) return;
     inFlight = true;
+    let explicitBackoff: number | null = null;
     beginCycleTracking();
     status.cycles += 1;
     status.lastPollAt = now();
@@ -1154,6 +1156,13 @@ export function createPoller(deps: PollerDeps) {
                 `delete ${config.cursorFile} to cold-start (no events are skipped until then)`,
             );
           }
+
+          const retryAfterMs = extractRetryAfterMs(err);
+          if (retryAfterMs !== null) {
+            console.warn(`[poller] RPC requested backoff for ${retryAfterMs}ms`);
+            explicitBackoff = retryAfterMs;
+            break; // Stop scanning other targets, they will likely hit the same limit
+          }
         }
       }
 
@@ -1188,6 +1197,7 @@ export function createPoller(deps: PollerDeps) {
         inFlight = false;
         endCycleTracking();
       }
+      if (explicitBackoff !== null) return explicitBackoff;
     }
   }
 
@@ -1201,6 +1211,7 @@ export function createPoller(deps: PollerDeps) {
 
   async function loop(): Promise<void> {
     if (stopped || paused || inFlight) return;
+    let nextDelay = config.pollIntervalMs;
     try {
       const delay = await cycle();
       if (typeof delay === "number" && delay > nextDelay) {
@@ -1219,7 +1230,7 @@ export function createPoller(deps: PollerDeps) {
       resumePending = false;
       schedule(0);
     } else {
-      schedule(config.pollIntervalMs);
+      schedule(nextDelay);
     }
   }
 
