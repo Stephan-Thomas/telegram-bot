@@ -36,6 +36,8 @@ Do not wire `npm run scan` into automated tests.
 | `tests/fixtures/cursor-corrupt.txt` | Unreadable cursor sample (cold-start path) |
 | `tests/fixtures.test.mjs` | Loads the fixture catalog and asserts notify / skip / boundary behaviour |
 | `tests/format.test.mjs` | Inline event-formatting units (MarkdownV2, USDC, Telegram send failures) |
+| `tests/dedup.test.mjs` | Inline unit cases for the bounded dedup window (`src/dedup.ts`) |
+| `tests/page-dedup.test.mjs` | Fake-RPC overlapping-page walk + fake-Telegram poller/restart cases |
 | `tests/bot.test.mjs` | Mocked grammy operator-command routing and exact reply payloads |
 | `tests/poller.test.mjs` | Cursor load/advance, RPC and Telegram failure, send cap, stop semantics, graceful-shutdown flush, drain deadline, shutdown notification drop |
 | `tests/poller-controls.test.mjs` | Pause/resume boundaries, restart cursor compatibility, RPC failure redaction |
@@ -103,7 +105,9 @@ log and not post).
 
 - **Valid cursor** (`cursor-valid.json`): version `1`, per-target opaque
   `cursor` string + `lastEventLedger`. Matches what the poller write-then-renames
-  under `CURSOR_FILE` (default `./data/cursor.json`).
+  under `CURSOR_FILE` (default `./data/cursor.json`). New files also carry an
+  additive, bounded `recentEventIds` dedup window; a file without it is still
+  valid and loads with an empty window.
 - **Corrupt cursor** (`cursor-corrupt.txt`): not JSON. The poller must treat this
   as a **cold start**, not a crash — leave the in-memory cursor null and begin
   `START_LOOKBACK_LEDGERS` behind tip.
@@ -143,6 +147,8 @@ test("resumes", () =>
 | Shutdown deadline expires | whatever was already on disk — never clobbered | the abandoned cycle may lose its remaining sends | Fake a server that never resolves; assert the file is byte-identical and no `.tmp` is left behind |
 | Unauthorized `/pause` or `/resume` | untouched | no command reply | Mock grammy with a different Telegram user id |
 | Operator pause → restart | version-1 cursor unchanged | no replay | Reload a valid cursor fixture; pause must not persist |
+| Overlapping page / resumed cursor | advances | duplicate suppressed, counted | Fake RPC returns the same event id twice; assert one send |
+| Restart with a saved window | resumed | boundary event suppressed | Point two pollers at one temp `CURSOR_FILE` |
 
 ## Failure drills against the local mock
 

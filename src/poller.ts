@@ -43,6 +43,7 @@ import type { rpc } from "@stellar/stellar-sdk";
 
 import type { SendExtra } from "./bot.js";
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, type BotConfig } from "./config.js";
+import { EventDedupWindow, eventKey } from "./dedup.js";
 import { explorerKeyboard, formatEvent, safeErrorMessage } from "./notifications/format.js";
 import { buildStatusSnapshot, writeStatusFile, type StatusSnapshot } from "./status.js";
 import { readContractEvents, type WatchTarget } from "./stellar/events.js";
@@ -94,6 +95,8 @@ export interface PollerStatus {
   eventsSkipped: number;
   /** Not attempted because a graceful shutdown started first. */
   notificationsDropped: number;
+  /** Events suppressed because they had already been processed (dedup). */
+  eventsDeduplicated: number;
   consecutiveFailures: number;
   lastError: { at: number; message: string } | null;
   /** In-memory cursor state is newer than the persisted file. */
@@ -118,12 +121,18 @@ interface CursorFile {
    * it, so the on-disk format stays version 1 either way.
    */
   chainClockAt?: number | null;
-  targets: Record<string, { cursor: string | null; lastEventLedger: number | null }>;
+  targets: Record<string, CursorTarget>;
 }
 
 interface CursorTarget {
   cursor: string | null;
   lastEventLedger: number | null;
+  /**
+   * Recently processed event ids, oldest first. Additive and bounded: older
+   * cursor files without it load as an empty window, and new files stay small
+   * because the window never grows past `EVENT_DEDUP_WINDOW`.
+   */
+  recentEventIds?: string[];
 }
 
 /**
@@ -190,6 +199,11 @@ function parseCursorFile(raw: string): CursorFile {
     targets[source] = {
       cursor: target.cursor ?? null,
       lastEventLedger: target.lastEventLedger ?? null,
+      // The dedup window is part of the cursor file: a restart must not
+      // re-notify the boundary event the inclusive cursor hands back.
+      recentEventIds: Array.isArray(target.recentEventIds)
+        ? target.recentEventIds.filter((id) => typeof id === "string")
+        : [],
     };
   }
 
@@ -399,6 +413,12 @@ export function createPoller(deps: PollerDeps) {
     ]),
   );
 
+  // Per-contract redelivery guard. Kept out of `TargetState` so status output
+  // stays plain data; the window is internal bookkeeping.
+  const dedup = new Map<ContractSource, EventDedupWindow>(
+    targets.map((t) => [t.source, new EventDedupWindow(config.dedupWindow)]),
+  );
+
   const status: PollerStatus = {
     running: false,
     paused: false,
@@ -414,6 +434,7 @@ export function createPoller(deps: PollerDeps) {
     notificationsFailed: 0,
     eventsSkipped: 0,
     notificationsDropped: 0,
+    eventsDeduplicated: 0,
     consecutiveFailures: 0,
     lastError: null,
     pendingFlush: false,
@@ -466,10 +487,14 @@ export function createPoller(deps: PollerDeps) {
     try {
       const parsed = parseCursorFile(raw);
       for (const [source, saved] of Object.entries(parsed.targets ?? {})) {
-        const target = state.get(source as ContractSource);
+        const key = source as ContractSource;
+        const target = state.get(key);
         if (!target) continue;
         target.cursor = saved.cursor ?? null;
         target.lastEventLedger = saved.lastEventLedger ?? null;
+        // Restore the redelivery window too. Without this a restart would
+        // re-notify the last event the inclusive cursor hands back.
+        dedup.set(key, EventDedupWindow.fromJSON(saved.recentEventIds, config.dedupWindow));
       }
       // Memory now equals the file; nothing is waiting to be flushed.
       status.pendingFlush = false;
@@ -506,7 +531,11 @@ export function createPoller(deps: PollerDeps) {
       targets: Object.fromEntries(
         [...state.values()].map((t) => [
           t.source,
-          { cursor: t.cursor, lastEventLedger: t.lastEventLedger },
+          {
+            cursor: t.cursor,
+            lastEventLedger: t.lastEventLedger,
+            recentEventIds: dedup.get(t.source)?.toJSON() ?? [],
+          } satisfies CursorTarget,
         ]),
       ),
     };
@@ -695,10 +724,13 @@ export function createPoller(deps: PollerDeps) {
         if (!current) continue;
 
         try {
+          const window = dedup.get(target.source) ?? new EventDedupWindow(0);
           const scan = await withTimeout(
             readContractEvents(server, target, {
               cursor: current.cursor ?? undefined,
               lookbackLedgers: current.cursor ? undefined : config.startLookbackLedgers,
+              seenEventIds: window.toJSON(),
+              dedupWindow: config.dedupWindow,
             }),
             SCAN_TIMEOUT_MS,
             "RPC scan",
@@ -746,8 +778,20 @@ export function createPoller(deps: PollerDeps) {
             status.circuitBreaker.lastFailureAt = null;
           }
 
+          if (scan.duplicates > 0) {
+            status.eventsDeduplicated += scan.duplicates;
+            console.log(
+              `[poller] ${target.source}: suppressed ${scan.duplicates} duplicate event(s) ` +
+                `from an overlapping page or a resumed cursor`,
+            );
+          }
+
           let delivery: NotificationResult = { sent: 0, failed: 0, skipped: 0 };
           if (scan.events.length > 0) {
+            // Record before notifying: an event is "processed" once it has been
+            // read, so a crash between send and save cannot replay it.
+            for (const event of scan.events) window.add(eventKey(event));
+            markDirty();
             delivery = await notify(scan.events);
             const skippedText = delivery.skipped > 0 ? ` (${delivery.skipped} skipped)` : "";
             console.log(

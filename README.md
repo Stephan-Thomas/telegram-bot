@@ -257,6 +257,26 @@ design of `src/stellar/events.ts`:
 
 So the walk terminates on the cursor, never on the payload.
 
+### Overlapping pages and duplicate events
+
+A cursor is **inclusive** of the event it names: the same event can come back
+from a later page of the same walk, and again from the next cycle that resumes
+from the persisted cursor — including the first cycle after a restart. Left
+unguarded, one on-chain event becomes two identical chat messages.
+
+The reader and the poller therefore share a small, bounded **dedup window**
+(`src/dedup.ts`): the ids of the most recently processed events per contract,
+oldest evicted first. A redelivery inside that window is dropped and counted
+instead of posted — visible as `duplicates=` in `npm run scan` output and as
+`eventsDeduplicated` on `/health`. The window is seeded into every scan from the
+cursor file, so the guard survives a restart, and it never grows with chain
+history: an event older than the window can legitimately be announced again,
+which is the accepted trade-off for O(1) memory and a cursor file that stays
+small. Set `EVENT_DEDUP_WINDOW=0` to disable suppression.
+
+This is suppression, not backfilling. A dropped duplicate does **not** hold the
+cursor back — the chain remains the record and the walk still advances.
+
 Events are also not a source of truth for current state — a claim's stakes and
 status come from the contract's own getters. This bot is a timeline, not an
 index.
@@ -300,11 +320,26 @@ so a crash mid-write cannot truncate it):
   "version": 1,
   "updatedAt": "2026-08-21T10:00:00.000Z",
   "targets": {
-    "market": { "cursor": "0018276211125911551-4294967295", "lastEventLedger": 4226729 },
-    "squad":  { "cursor": "0018276211125911551-4294967295", "lastEventLedger": 4226733 }
+    "market": {
+      "cursor": "0018276211125911551-4294967295",
+      "lastEventLedger": 4226729,
+      "recentEventIds": ["0018276211125911551-4294967295", "0018276211125911552-1"]
+    },
+    "squad": {
+      "cursor": "0018276211125911551-4294967295",
+      "lastEventLedger": 4226733,
+      "recentEventIds": []
+    }
   }
 }
 ```
+
+`recentEventIds` is the persisted **dedup window** (see
+[Overlapping pages and duplicate events](#overlapping-pages-and-duplicate-events))
+and is additive: it is bounded by `EVENT_DEDUP_WINDOW` (default `256`) and older
+cursor files without the field load as an empty window. The `version` and the
+`cursor` / `lastEventLedger` fields are unchanged, so the format stays
+backward-compatible in both directions.
 
 On a cold start (no file) it begins `START_LOOKBACK_LEDGERS` behind the chain tip
 rather than replaying the whole retained window into your chat. `/pause` and
@@ -359,6 +394,10 @@ This process is meant to stay up for weeks, so a single failure never ends it:
 
   down. RPC, Telegram, and poller error text shown in `/status` or logs is
   compact, bounded, and the configured bot token is redacted.
+- **A duplicate event** — the same id from an overlapping page, a resumed
+  cursor, or a restart — is suppressed and counted (`eventsDeduplicated`), never
+  posted twice. It does not hold the cursor back. Bounded per contract by
+  `EVENT_DEDUP_WINDOW` (default `256`; `0` disables).
 - **A long Stellar outage** freezes the chain clock at the newest close time the
   RPC actually reported. `/status` and `GET /health` then show a growing skew
   rather than a clock that keeps time on its own, so a stalled chain and a
@@ -496,6 +535,7 @@ src/
   health.ts                local loopback GET /health for supervisors
   config.ts                env loading and validation, fails fast (MIMIR_PROFILE profiles)
   bot.ts                   grammy setup: /start, /help, /status, /contracts, operator pause/resume
+  dedup.ts                 bounded event-id window (reader + poller dedup)
   poller.ts                the loop: scan, notify, persist the cursor
   status.ts                machine-readable status snapshot (allowlisted, bounded)
   stellar/
