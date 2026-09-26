@@ -45,6 +45,15 @@ export interface HealthReport {
     lastSuccessAt: string | null;
     latestLedger: number | null;
     oldestLedger: number | null;
+    /** Newest observed chain close time (ISO 8601); null until one is seen. */
+    chainClockAt: string | null;
+    /**
+     * Chain clock skew in ms: `checkedAt - chainClockAt`. Positive while the
+     * bot's clock is ahead of the newest chain time it has seen, negative when
+     * it is behind, null when no chain time has been observed yet (cold start,
+     * or a run of scans that returned no events).
+     */
+    chainClockSkewMs: number | null;
     notificationsSent: number;
     notificationsFailed: number;
     eventsSkipped: number;
@@ -74,6 +83,38 @@ function previewCursor(cursor: string | null): string | null {
   return `${cursor.slice(0, CURSOR_PREVIEW_LEN)}…`;
 }
 
+/** Bounded human duration for a skew: s, m, h, d, then years. */
+function formatSkew(absMs: number): string {
+  const dayMs = 86_400_000;
+  if (absMs < 60_000) return `${(absMs / 1000).toFixed(1)}s`;
+  if (absMs < 3_600_000) return `${Math.round(absMs / 60_000)}m`;
+  if (absMs < 3_600_000 * 24) return `${Math.round(absMs / 3_600_000)}h`;
+  if (absMs < dayMs * 365) return `${Math.round(absMs / dayMs)}d`;
+  return `${Math.round(absMs / (dayMs * 365))}y`;
+}
+
+/**
+ * Human rendering of the chain clock skew, shared by `/status` and `/health`.
+ *
+ * `chainClockAt` is the newest chain close time the poller observed; the skew
+ * is `nowMs - chainClockAt`. The wording always names the side that is ahead,
+ * because a bare "+3s" or "behind" is ambiguous about which clock is wrong.
+ *
+ * Returns plain text (no Markdown): pass it through `escapeMd` before putting
+ * it in a Telegram message. `unknown` before the first observation, `in sync`
+ * inside one second, otherwise a bounded `s`/`m`/`h`/`d`/`y` duration.
+ */
+export function chainClockLabel(chainClockAt: number | null | undefined, nowMs: number): string {
+  if (typeof chainClockAt !== "number" || !Number.isFinite(chainClockAt)) return "unknown";
+  const skewMs = nowMs - chainClockAt;
+  const abs = Math.abs(skewMs);
+  if (abs < 1_000) return "in sync";
+  const human = formatSkew(abs);
+  return skewMs >= 0
+    ? `local clock ${human} ahead of chain`
+    : `chain clock ${human} ahead of local`;
+}
+
 /**
  * Build a health report from poller status.
  *
@@ -89,6 +130,12 @@ export function buildHealthReport(
   nowMs: number = Date.now(),
 ): HealthReport {
   const uptimeMs = poller.startedAt > 0 ? Math.max(0, nowMs - poller.startedAt) : 0;
+  // Tolerate a status snapshot that never learned about the chain clock (and
+  // any non-finite value): the report must stay JSON-serialisable, never NaN.
+  const chainClockAt =
+    typeof poller.chainClockAt === "number" && Number.isFinite(poller.chainClockAt)
+      ? poller.chainClockAt
+      : null;
 
   let status: HealthReport["status"];
   if (!poller.running) {
@@ -123,6 +170,8 @@ export function buildHealthReport(
       lastSuccessAt: iso(poller.lastSuccessAt),
       latestLedger: poller.latestLedger,
       oldestLedger: poller.oldestLedger,
+      chainClockAt: iso(chainClockAt),
+      chainClockSkewMs: chainClockAt === null ? null : nowMs - chainClockAt,
       notificationsSent: poller.notificationsSent,
       notificationsFailed: poller.notificationsFailed,
       eventsSkipped: poller.eventsSkipped,

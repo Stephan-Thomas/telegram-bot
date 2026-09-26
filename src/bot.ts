@@ -14,7 +14,7 @@ import { escapeMd, previewMessage, safeErrorMessage } from "./notifications/form
 export { previewMessage } from "./notifications/format.js";
 import { networkLabel, type BotConfig } from "./config.js";
 import { contractExplorerUrl } from "./stellar/client.js";
-import { buildHealthReport } from "./health.js";
+import { buildHealthReport, chainClockLabel } from "./health.js";
 import type { PollerPauseResult, PollerResumeResult, PollerStatus } from "./poller.js";
 
 const HELP_BASE = [
@@ -65,6 +65,7 @@ function statusMessage(config: BotConfig, status: PollerStatus, nowMs: number = 
     "",
     `Chain tip: ${status.latestLedger ?? "unknown"}`,
     `RPC retains from ledger: ${status.oldestLedger ?? "unknown"}`,
+    `Chain clock skew: ${escapeMd(chainClockLabel(status.chainClockAt, nowMs))}`,
     `Poll interval: ${Math.round(config.pollIntervalMs / 1000)}s · last poll ${ago(status.lastPollAt, nowMs)}`,
     `Cycles: ${status.cycles} · sent ${status.notificationsSent} · failed sends ${status.notificationsFailed} · skipped ${status.eventsSkipped}`,
     "",
@@ -117,6 +118,7 @@ export function healthMessage(
     `Poll interval: ${Math.round(config.pollIntervalMs / 1000)}s · last poll ${ago(status.lastPollAt, nowMs)}`,
     `Last successful poll: ${ago(status.lastSuccessAt, nowMs)}`,
     `Chain tip: ${report.poller.latestLedger ?? "unknown"}`,
+    `Chain clock skew: ${escapeMd(chainClockLabel(status.chainClockAt, nowMs))}`,
     `Cycles: ${report.poller.cycles} · consecutive failures: ${report.poller.consecutiveFailures}`,
     `Notifications: sent ${report.poller.notificationsSent} · failed ${report.poller.notificationsFailed} · skipped ${report.poller.eventsSkipped}`,
     "",

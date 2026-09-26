@@ -78,6 +78,7 @@ The poller is the central orchestrator that runs a recurring loop to scan contra
 **State management:**
 - Per-target state: `cursor` (opaque string), `lastEventLedger` (number), `lastError` (string)
 - Global counters: `cycles`, `notificationsSent`, `notificationsFailed`, `eventsSkipped`, `consecutiveFailures`
+- Chain clock: `chainClockAt`, the newest close time actually observed (monotonic, persisted with the cursors); skew is derived as `now - chainClockAt`
 
 ### Scanner (`src/stellar/events.ts`)
 
@@ -128,7 +129,7 @@ The bot uses grammy for Telegram integration with a thin command layer and a sin
 
 **Command handlers:**
 - `/start`, `/help`: Bot information and command list
-- `/status`: Poller state, cursors, counters, last error
+- `/status`: Poller state, chain clock skew, cursors, counters, last error
 - `/health`: Health assessment and operational readiness
 - `/contracts`: Contract IDs and explorer links
 - `/preview`: Preview notification formatting
@@ -151,6 +152,10 @@ Local HTTP endpoint for process supervisors and deploy checks. Bound to loopback
 - **ok**: Poller running and healthy (including intentional pause)
 - **degraded**: Poller running but stale or failing repeatedly
 - **stopped**: Poller not running
+
+**Chain clock:**
+- `poller.chainClockAt`: newest observed chain close time (ISO 8601), or `null`
+- `poller.chainClockSkewMs`: `checkedAt - chainClockAt` in milliseconds; positive while the bot is ahead of the chain, `null` before the first observation
 
 **Safety:**
 - JSON-only responses

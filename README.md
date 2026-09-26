@@ -105,7 +105,7 @@ looks healthy but notifies nobody.
 |---|---|
 | `/start` | What the bot is |
 | `/help` | Same, plus the command list |
-| `/status` | Chain tip, the RPC's retained-history floor, both watched contract ids, the last ledger an event was seen in per contract, the persisted cursor, poll/send counters and the last error |
+| `/status` | Chain tip, the RPC's retained-history floor, the chain clock skew (newest chain close time the bot has seen, against its own clock), both watched contract ids, the last ledger an event was seen in per contract, the persisted cursor, poll/send counters and the last error |
 | `/contracts` | The two contract ids this bot watches (`mimir-market`, `mimir-squad`) and a [stellar.expert](https://stellar.expert) link for each. Reads only from config, so it answers the same during a cold start, a run of RPC failures, or between restarts — unlike `/status`, there is nothing here that can be "unhealthy" |
 | `/preview` | Previews channel notification formatting for `mimir-market` or `mimir-squad` without affecting cursors or poller state |
 | `/pause` | Operator only. Stops scheduling new poll cycles; a scan already in progress may finish and persist its normal cursor |
@@ -286,6 +286,12 @@ This process is meant to stay up for weeks, so a single failure never ends it:
   spaced out, so Telegram's rate limiter is never the thing that takes the bot
   down. RPC, Telegram, and poller error text shown in `/status` or logs is
   compact, bounded, and the configured bot token is redacted.
+- **A long Stellar outage** freezes the chain clock at the newest close time the
+  RPC actually reported. `/status` and `GET /health` then show a growing skew
+  rather than a clock that keeps time on its own, so a stalled chain and a
+  wrong local clock stay distinguishable. The clock is saved with the cursors,
+  so a restart resumes it instead of reporting `unknown`, and an event without
+  a `ledgerClosedAt` never counts as a chain time.
 - **An operator pause** prevents new cycles but cannot cancel a bounded scan or
   Telegram retry loop already in progress. That cycle follows the normal cursor
   rules above; `/resume` starts the next cycle immediately.
@@ -296,6 +302,8 @@ The notifier is meant to run for weeks through Stellar RPC and Telegram outages.
 Everything it keeps in memory is fixed-size or capped:
 
 - Per-target state is two small records (cursor, last event ledger, last error).
+- The chain clock is one timestamp (the newest observed close time) plus its
+  derived skew; it never accumulates history.
 - A scan walks at most 20 event pages, and each cycle sends at most
   `MAX_NOTIFICATIONS_PER_CYCLE` messages; the rest are counted as skipped.
 - Error text is redacted (bot token) and clipped before it reaches `/status`,
@@ -316,9 +324,11 @@ supervisor that restarts the process and probes `GET /health`. If you suspect a
 leak in production, watch the process RSS over days; a restart is always safe.
 
 **Rollback:** deploy the previous build and start it against the same
-`CURSOR_FILE`. The cursor format is unchanged (version 1) and the chain is the
-source of truth, so nothing is replayed beyond the last saved cursor and nothing
-needs migrating. Keep a copy of the cursor file if you want an exact resume point.
+`CURSOR_FILE`. The cursor format is unchanged (version 1): `chainClockAt` is an
+optional additive field that older builds ignore and newer builds load as `null`
+when it is absent, and the chain is the source of truth, so nothing is replayed
+beyond the last saved cursor and nothing needs migrating. Keep a copy of the
+cursor file if you want an exact resume point.
 
 ## Health endpoint
 
@@ -331,8 +341,11 @@ checks (default `http://127.0.0.1:8787`):
 | `GET /health/live` (alias `/livez`) | Liveness only — the process and HTTP server are up. Always `200` while listening. |
 
 The JSON body is operational status only: poller counters, ledgers, truncated
-cursors, and whether a target has an error. It never includes `BOT_TOKEN`,
-chat ids, private keys, or unbounded remote payloads.
+cursors, whether a target has an error, and the chain clock (`poller.chainClockAt`
+plus `poller.chainClockSkewMs`, the signed difference in milliseconds between the
+bot's clock and the newest chain close time it has observed — positive while the
+bot is ahead). It never includes `BOT_TOKEN`, chat ids, private keys, or
+unbounded remote payloads.
 
 Configuration (see `.env.example`):
 

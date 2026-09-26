@@ -35,6 +35,7 @@ function baseStatus(overrides = {}) {
     lastSuccessAt: 5_000,
     latestLedger: 42,
     oldestLedger: 1,
+    chainClockAt: 5_000,
     notificationsSent: 2,
     notificationsFailed: 0,
     eventsSkipped: 1,
@@ -155,6 +156,9 @@ test("GET /health returns 200 and redacted JSON for a healthy poller", async () 
     const body = await res.json();
     assert.equal(body.ok, true);
     assert.equal(body.status, "ok");
+    // Chain clock: baseStatus saw chain time at 5_000, the probe runs at 5_500.
+    assert.equal(body.poller.chainClockAt, new Date(5_000).toISOString());
+    assert.equal(body.poller.chainClockSkewMs, 500);
     const text = JSON.stringify(body);
     assert.equal(text.includes(secret), false);
     assert.equal(text.includes(chat), false);
