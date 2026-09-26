@@ -113,6 +113,18 @@ const DEFAULTS = {
   channelPreviewMode: false,
 } as const;
 
+/**
+ * Platform deployers (Railway among them) inject a `PORT` variable and probe it
+ * for the deploy healthcheck. When `HEALTH_PORT` is unset we fall back to it,
+ * so the `/health` listener is reachable without a manual override. `PORT` is
+ * not a default local dev value, so the loopback port still wins on a desktop.
+ */
+function defaultHealthPort(): number {
+  const port = Number(process.env.PORT);
+  if (Number.isInteger(port) && port > 0) return port;
+  return DEFAULTS.healthPort;
+}
+
 /** Strkey for a contract: `C` + 55 base32 characters. */
 const CONTRACT_ID_RE = /^C[A-Z2-7]{55}$/;
 
@@ -343,7 +355,7 @@ export function loadConfig(): BotConfig {
     ),
     healthHost: c.host("HEALTH_HOST", DEFAULTS.healthHost),
     // Port 0 is the explicit disable switch (min 0).
-    healthPort: c.int("HEALTH_PORT", DEFAULTS.healthPort, 0),
+    healthPort: c.int("HEALTH_PORT", defaultHealthPort(), 0),
     healthStaleMs: c.int("HEALTH_STALE_MS", DEFAULTS.healthStaleMs, 0),
     shutdownTimeoutMs: c.int("SHUTDOWN_TIMEOUT_MS", DEFAULTS.shutdownTimeoutMs, 0),
     channelPreviewMode: c.bool("CHANNEL_PREVIEW_MODE", DEFAULTS.channelPreviewMode),

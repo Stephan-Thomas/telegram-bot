@@ -52,3 +52,34 @@ test("SHUTDOWN_TIMEOUT_MS rejects negative and non-numeric budgets at boot", () 
     );
   }
 });
+
+// Health-port resolution: Railway injects `PORT` and probes it for the deploy
+// healthcheck, so the health endpoint falls back to it when `HEALTH_PORT` is
+// unset — without changing the loopback default where `PORT` does not exist.
+function healthPortWith(patch) {
+  return withEnv(patch, () => loadConfig().healthPort);
+}
+
+test("explicit HEALTH_PORT wins over an injected PORT", () => {
+  assert.equal(healthPortWith({ HEALTH_PORT: "9999", PORT: "8888" }), 9999);
+});
+
+test("falls back to the injected PORT when HEALTH_PORT is unset", () => {
+  assert.equal(healthPortWith({ PORT: "8080" }), 8080);
+});
+
+test("keeps the loopback default when neither HEALTH_PORT nor PORT is set", () => {
+  assert.equal(healthPortWith({}), 8787);
+});
+
+test("ignores a non-numeric injected PORT", () => {
+  assert.equal(healthPortWith({ PORT: "not-a-port" }), 8787);
+});
+
+test("ignores a zero injected PORT (Railway disables it in some plans)", () => {
+  assert.equal(healthPortWith({ PORT: "0" }), 8787);
+});
+
+test("HEALTH_PORT=0 still disables the listener on a platform with PORT", () => {
+  assert.equal(healthPortWith({ HEALTH_PORT: "0", PORT: "8443" }), 0);
+});

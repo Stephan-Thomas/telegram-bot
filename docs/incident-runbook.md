@@ -208,6 +208,21 @@ If the filesystem is ephemeral, every restart behaves like a cold start. Events 
 
 Use persistent storage for long-running deployments.
 
+## Railway deployment
+
+The Railway deployment (`railway.json`) mounts a persistent volume at `/app/data` and requires it via `requiredMountPath` — Railway refuses to start the service until a volume exists at that path.
+
+A redeploy of a volume-backed service has a short downtime window: Railway allows only one active deployment per volume at a time. Rollback redeploys the previous revision; the volume is preserved and the cursor survives.
+
+Verify after deployment and during incidents:
+
+1. Confirm the volume is attached at `/app/data` (injected as `RAILWAY_VOLUME_MOUNT_PATH`).
+2. Confirm `HEALTH_HOST=0.0.0.0` is set — Railway's healthcheck probe crosses the container network and cannot reach a loopback-only `/health` listener. The health port follows the injected `PORT` when `HEALTH_PORT` is unset.
+3. Confirm the persisted cursor lives at `/app/data/cursor.json` and `/status` shows a non-empty cursor.
+4. Confirm `/health` responds `200` in the Rails health tab after the first successful poll.
+
+Do not delete `/app/data` cursor state as part of a normal rollback.
+
 ## Rate limiting
 
 Notification bursts are bounded by `MAX_NOTIFICATIONS_PER_CYCLE` and spaced out.
@@ -262,7 +277,7 @@ Before deployment:
 
 * `.env` contains valid configuration without exposing secrets in source control.
 * `BOT_TOKEN` and `TELEGRAM_CHAT_ID` are supplied through the deployment secret/configuration mechanism.
-* `data/` or `CURSOR_FILE` is persistent.
+* `data/` or `CURSOR_FILE` is persistent — on Railway, a volume attached at `/app/data` (see `railway.json`).
 * The deployed revision passes typecheck and build checks.
 * No production credentials are committed.
 
