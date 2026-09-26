@@ -2,7 +2,7 @@
 
 A Telegram notifier for [Mimir](https://github.com/mimir-stellar), the AI-settled
 prediction market on Stellar. It polls Mimir's two Soroban contracts for new
-on-chain events and posts them, human-readable, into a chat or channel:
+on-chain events and posts them, human-readable, into one or more named chats or channels:
 
 ```
 🆕 New claim #7
@@ -94,7 +94,10 @@ docker run -d \
 ```
 
 `.env.example` ships with the live Stellar Testnet contract ids, so the only two
-values you must supply are `BOT_TOKEN` and `TELEGRAM_CHAT_ID`. Every other
+values you must supply are `BOT_TOKEN` and `TELEGRAM_CHAT_ID`. To split traffic,
+set `TELEGRAM_MARKET_CHAT_ID` and/or `TELEGRAM_SQUAD_CHAT_ID`; each overrides the
+legacy destination for that contract, while an omitted override falls back to
+`TELEGRAM_CHAT_ID`. Every other
 variable is documented inline there. A missing or malformed value aborts startup
 with all the problems listed at once — the bot never boots into a state where it
 looks healthy but notifies nobody.
@@ -268,8 +271,9 @@ This process is meant to stay up for weeks, so a single failure never ends it:
   `MAX_NOTIFICATIONS_PER_CYCLE`, and sends that exhaust three bounded retries
   are counted as skipped or failed and are not replayed. Holding the cursor
   back would turn a revoked token or removed chat into an infinite replay, and
-  recovery would flood the channel. Notifications are lossy on purpose — the
-  chain is the record; the poller logs the sent/failed/skipped commit decision.
+  recovery would flood the channel. A failed send is isolated to that routed
+  chat and event; other events continue. Notifications are lossy on purpose —
+  the chain is the record; the poller logs the sent/failed/skipped commit decision.
 - **A corrupt cursor file** is treated as a cold start rather than a crash. A
   valid but RPC-rejected stale cursor is never silently rewound: the target keeps
   that cursor, the error becomes visible in `/status`, and scheduled retries or

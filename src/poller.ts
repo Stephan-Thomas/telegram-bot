@@ -197,7 +197,7 @@ export interface PollerDeps {
   config: BotConfig;
   server: rpc.Server;
   /** Sends one already-formatted MarkdownV2 message. May reject. */
-  send: (text: string) => Promise<void>;
+  send: (text: string, source?: ContractSource) => Promise<void>;
   sendOptions?: SendOptions;
   /** Circuit breaker configuration */
   circuitBreakerOptions?: CircuitBreakerOptions;
@@ -555,7 +555,7 @@ export function createPoller(deps: PollerDeps) {
 
       try {
         // Use bounded retry for Telegram sends to handle transient failures
-        await sendWithRetry(send, text, config.botToken, deps.sendOptions, () => !status.stopping);
+        await sendWithRetry((message) => send(message, event.source), text, config.botToken, deps.sendOptions, () => !status.stopping);
         status.notificationsSent += 1;
         sentThisCycle += 1;
       } catch (err) {

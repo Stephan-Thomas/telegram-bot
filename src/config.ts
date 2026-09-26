@@ -48,6 +48,9 @@ export interface StellarConfig {
 export interface BotConfig extends StellarConfig {
   botToken: string;
   chatId: string;
+  /** Optional per-contract destinations; absent values use `chatId`. */
+  marketChatId?: string;
+  squadChatId?: string;
   /** Chats allowed to use /status. Empty array means no restriction. */
   allowedChatIds: string[];
   /** Telegram user id allowed to run operator-only commands. Null disables them. */
@@ -235,6 +238,17 @@ function collector(profile: Record<string, string>) {
       return value;
     },
 
+    optionalChatId(name: string, fallback: string): string {
+      const value = read(name) ?? fallback;
+      if (value === "") return value;
+      if (!/^-?\d+$/.test(value) && !/^@[A-Za-z0-9_]{4,}$/.test(value)) {
+        problems.push(
+          `${name} must be a numeric chat id (e.g. -1001234567890) or a @channelusername; got "${value}"`,
+        );
+      }
+      return value;
+    },
+
     /**
      * Parses an optional comma-separated list of chat ids / @usernames.
      * Returns an empty array when the variable is absent or empty (= no
@@ -315,6 +329,8 @@ export function loadConfig(): BotConfig {
     ...stellar,
     botToken: c.required("BOT_TOKEN"),
     chatId: c.chatId("TELEGRAM_CHAT_ID"),
+    marketChatId: c.optionalChatId("TELEGRAM_MARKET_CHAT_ID", c.get("TELEGRAM_CHAT_ID") ?? ""),
+    squadChatId: c.optionalChatId("TELEGRAM_SQUAD_CHAT_ID", c.get("TELEGRAM_CHAT_ID") ?? ""),
     allowedChatIds: c.allowedChatIds("ALLOWED_CHAT_IDS"),
     operatorTelegramUserId: c.optionalUserId("OPERATOR_TELEGRAM_USER_ID"),
     pollIntervalMs: c.int("POLL_INTERVAL_MS", DEFAULTS.pollIntervalMs, DEFAULTS.minPollIntervalMs),
