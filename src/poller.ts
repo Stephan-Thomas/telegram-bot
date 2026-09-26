@@ -41,8 +41,9 @@ import path from "node:path";
 
 import type { rpc } from "@stellar/stellar-sdk";
 
+import type { SendExtra } from "./bot.js";
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, type BotConfig } from "./config.js";
-import { formatEvent, safeErrorMessage } from "./notifications/format.js";
+import { explorerKeyboard, formatEvent, safeErrorMessage } from "./notifications/format.js";
 import { readContractEvents, type WatchTarget } from "./stellar/events.js";
 import type { ContractSource, DecodedEvent } from "./stellar/decode.js";
 
@@ -210,8 +211,12 @@ export interface SendOptions {
 export interface PollerDeps {
   config: BotConfig;
   server: rpc.Server;
-  /** Sends one already-formatted MarkdownV2 message. May reject. */
-  send: (text: string, source?: ContractSource) => Promise<void>;
+  /**
+   * Sends one already-formatted MarkdownV2 message to the chat routed for
+   * `source`, with the event's explorer button when `extra.reply_markup` is
+   * set. May reject.
+   */
+  send: (text: string, source?: ContractSource, extra?: SendExtra) => Promise<void>;
   sendOptions?: SendOptions;
   /** Circuit breaker configuration */
   circuitBreakerOptions?: CircuitBreakerOptions;
@@ -562,7 +567,27 @@ export function createPoller(deps: PollerDeps) {
         continue;
       }
 
-      const text = formatEvent(config, event);
+      // Formatting one event must never abort the rest of the batch: remote
+      // event data is untrusted, so a malformed value is a skip, not a throw.
+      // Only safe identifiers are logged — never the raw remote payload.
+      let text: string | null;
+      let extra: SendExtra | undefined;
+      try {
+        text = formatEvent(config, event);
+        if (text !== null) {
+          const reply_markup = explorerKeyboard(config, event);
+          if (reply_markup) extra = { reply_markup };
+        }
+      } catch (err) {
+        status.eventsSkipped += 1;
+        skipped += 1;
+        console.error(
+          `[poller] format failed for ${event.source} event at ledger ${event.ledger}: ` +
+            errorMessage(err),
+          { eventId: event.eventId, reason: "malformed_event" },
+        );
+        continue;
+      }
       if (text === null) {
         status.eventsSkipped += 1;
         skipped += 1;
@@ -581,7 +606,7 @@ export function createPoller(deps: PollerDeps) {
 
       try {
         // Use bounded retry for Telegram sends to handle transient failures
-        await sendWithRetry((message) => send(message, event.source), text, config.botToken, deps.sendOptions, () => !status.stopping);
+        await sendWithRetry((message) => send(message, event.source, extra), text, config.botToken, deps.sendOptions, () => !status.stopping);
         status.notificationsSent += 1;
         sentThisCycle += 1;
       } catch (err) {

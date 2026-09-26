@@ -10,7 +10,7 @@
 import { Bot, type Context } from "grammy";
 import type { UserFromGetMe } from "grammy/types";
 
-import { escapeMd, previewMessage, safeErrorMessage } from "./notifications/format.js";
+import { escapeMd, previewMessage, safeErrorMessage, type ExplorerKeyboard } from "./notifications/format.js";
 export { previewMessage } from "./notifications/format.js";
 import { networkLabel, type BotConfig } from "./config.js";
 import { contractExplorerUrl } from "./stellar/client.js";
@@ -325,15 +325,26 @@ export function createBot(deps: BotDeps): Bot {
   return bot;
 }
 
-/** The poller's send path: route each contract's messages to its named chat. */
+/** Extra Telegram send options the poller may attach to a notification. */
+export interface SendExtra {
+  reply_markup?: ExplorerKeyboard | undefined;
+}
+
+/**
+ * The poller's send path: route each contract's messages to its named chat,
+ * with the event's explorer button when `extra.reply_markup` is set.
+ */
 export function createNotifier(bot: Bot, config: BotConfig) {
-  return async (text: string, source?: ContractSource): Promise<void> => {
+  return async (text: string, source?: ContractSource, extra?: SendExtra): Promise<void> => {
     const chatId = source === "market"
       ? config.marketChatId ?? config.chatId
       : source === "squad"
         ? config.squadChatId ?? config.chatId
         : config.chatId;
-    await bot.api.sendMessage(chatId, text, TELEGRAM_OPTIONS);
+    await bot.api.sendMessage(chatId, text, {
+      ...TELEGRAM_OPTIONS,
+      ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
+    });
   };
 }
 

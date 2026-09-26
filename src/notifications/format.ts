@@ -93,11 +93,62 @@ function clip(text: string, max = MAX_EVENT_FIELD_LENGTH): string {
 
 function footer(config: StellarConfig, event: DecodedEvent): string {
   const ledger = escapeMd(`ledger ${event.ledger}`);
+  const url = eventExplorerUrl(config, event);
+  if (!url) return `_${ledger}_`;
+  return `_${ledger}_ · [tx](${url})`;
+}
+
+/**
+ * A Stellar transaction hash as returned by the RPC: 64 lowercase or uppercase
+ * hex characters (32 bytes). Anything else is treated as missing — the
+ * notification is still sent, just without an explorer link/button.
+ */
+const TX_HASH_RE = /^[0-9a-fA-F]{64}$/;
+
+/** Explorer URL for an event's transaction, or null when it has none usable. */
+export function eventExplorerUrl(config: StellarConfig, event: DecodedEvent): string | null {
   // Link only well-formed 64-hex transaction hashes. An externally-derived
-  // identifier that is empty, oversized or malformed stays plain text: a broken
+  // identifier that is empty, oversized or malformed gets no link: a broken
   // explorer link is worse than no link, and the hash itself is never altered here.
-  if (event.txHash.length > MAX_TX_HASH_LENGTH || !isUsableTxHash(event.txHash)) return `_${ledger}_`;
-  return `_${ledger}_ · [tx](${txExplorerUrl(config, event.txHash.trim())})`;
+  const raw = event.txHash ?? "";
+  if (raw.length > MAX_TX_HASH_LENGTH || !isUsableTxHash(raw)) return null;
+  const txHash = raw.trim();
+  if (!TX_HASH_RE.test(txHash)) return null;
+  try {
+    const url = txExplorerUrl(config, txHash);
+    const parsed = new URL(url);
+    if (parsed.protocol !== "https:") return null;
+    return url;
+  } catch {
+    return null;
+  }
+}
+
+export interface ExplorerButton {
+  text: string;
+  url: string;
+}
+
+export interface ExplorerKeyboard {
+  inline_keyboard: ExplorerButton[][];
+}
+
+/**
+ * Telegram inline keyboard for an event notification.
+ *
+ * Returns undefined when the event carries no usable transaction hash, so the
+ * caller sends the existing text-only message unchanged. The button reuses the
+ * same canonical explorer URL as the `· [tx](…)` footer link — the footer stays
+ * as the text fallback, the button is progressive enhancement in the same
+ * Telegram request (no second message, no extra rate-limit cost).
+ */
+export function explorerKeyboard(
+  config: StellarConfig,
+  event: DecodedEvent,
+): ExplorerKeyboard | undefined {
+  const url = eventExplorerUrl(config, event);
+  if (!url) return undefined;
+  return { inline_keyboard: [[{ text: "View on Explorer", url }]] };
 }
 
 /**

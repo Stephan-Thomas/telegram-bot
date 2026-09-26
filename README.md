@@ -274,6 +274,9 @@ This process is meant to stay up for weeks, so a single failure never ends it:
   recovery would flood the channel. A failed send is isolated to that routed
   chat and event; other events continue. Notifications are lossy on purpose —
   the chain is the record; the poller logs the sent/failed/skipped commit decision.
+  A rejected inline keyboard (or a malformed MarkdownV2 payload) fails the same
+  way as any other send. Events without a usable transaction hash are still
+  sent, just without the explorer button.
 - **A corrupt cursor file** is treated as a cold start rather than a crash. A
   valid but RPC-rejected stale cursor is never silently rewound: the target keeps
   that cursor, the error becomes visible in `/status`, and scheduled retries or
