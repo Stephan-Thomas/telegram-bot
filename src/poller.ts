@@ -678,11 +678,12 @@ export function createPoller(deps: PollerDeps) {
 
           let delivery: NotificationResult = { sent: 0, failed: 0, skipped: 0 };
           if (scan.events.length > 0) {
+            delivery = await notify(scan.events);
+            const skippedText = delivery.skipped > 0 ? ` (${delivery.skipped} skipped)` : "";
             console.log(
               `[poller] ${target.source}: ${scan.events.length} event(s) ` +
-                `up to ledger ${scan.lastEventLedger} in ${scan.pages} page(s)`,
+                `up to ledger ${scan.lastEventLedger} in ${scan.pages} page(s)${skippedText}`,
             );
-            delivery = await notify(scan.events);
           }
 
           if (scan.lastEventLedger !== null && scan.lastEventLedger !== current.lastEventLedger) {
