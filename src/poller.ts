@@ -216,6 +216,30 @@ const DEFAULT_MAX_BACKOFF_MS = 10_000;
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 
+/** Timeout for each RPC scan request */
+const SCAN_TIMEOUT_MS = 15_000;
+
+/** Timeout for each Telegram send attempt */
+const SEND_TIMEOUT_MS = 10_000;
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${ms}ms`));
+    }, ms);
+    if (timer.unref) { timer.unref(); }
+    Promise.resolve(promise)
+      .then((val) => {
+        clearTimeout(timer);
+        resolve(val);
+      })
+      .catch((err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+  });
+}
+
 /**
  * Sends a message with bounded exponential backoff.
  *
@@ -237,7 +261,7 @@ async function sendWithRetry(
 
   while (true) {
     try {
-      await send(text);
+      await withTimeout(send(text), SEND_TIMEOUT_MS, "Telegram send");
       return;
     } catch (err) {
       attempt++;
@@ -480,10 +504,14 @@ export function createPoller(deps: PollerDeps) {
       if (!current) continue;
 
       try {
-        const scan = await readContractEvents(server, target, {
-          cursor: current.cursor ?? undefined,
-          lookbackLedgers: current.cursor ? undefined : config.startLookbackLedgers,
-        });
+        const scan = await withTimeout(
+          readContractEvents(server, target, {
+            cursor: current.cursor ?? undefined,
+            lookbackLedgers: current.cursor ? undefined : config.startLookbackLedgers,
+          }),
+          SCAN_TIMEOUT_MS,
+          "RPC scan",
+        );
 
         status.latestLedger = scan.latestLedger;
         status.oldestLedger = scan.oldestLedger;
