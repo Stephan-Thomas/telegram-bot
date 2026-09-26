@@ -37,16 +37,39 @@ export interface HealthReport {
   checkedAt: string;
   poller: {
     running: boolean;
+    /** Intentional operator pause; process is ready but scheduling is stopped. */
+    paused: boolean;
+    /** A graceful shutdown is draining: no new cycles, unsent messages dropped. */
+    stopping: boolean;
+    channelPreviewMode: boolean;
     cycles: number;
     lastPollAt: string | null;
     lastSuccessAt: string | null;
     latestLedger: number | null;
     oldestLedger: number | null;
+    /** Newest observed chain close time (ISO 8601); null until one is seen. */
+    chainClockAt: string | null;
+    /**
+     * Chain clock skew in ms: `checkedAt - chainClockAt`. Positive while the
+     * bot's clock is ahead of the newest chain time it has seen, negative when
+     * it is behind, null when no chain time has been observed yet (cold start,
+     * or a run of scans that returned no events).
+     */
+    chainClockSkewMs: number | null;
     notificationsSent: number;
     notificationsFailed: number;
     eventsSkipped: number;
+    /** Events suppressed as already-seen across overlapping pages / resumes. */
+    eventsDeduplicated: number;
+    notificationsDropped: number;
     consecutiveFailures: number;
     lastError: { at: string; message: string } | null;
+    /**
+     * In-memory cursor state that is not on disk yet. False after a successful
+     * flush, which is what a shutdown is for.
+     */
+    pendingFlush: boolean;
+    lastFlushAt: string | null;
     targets: Array<{
       source: string;
       /** Public contract id (on-chain). */
@@ -71,6 +94,38 @@ function previewCursor(cursor: string | null): string | null {
   return `${cursor.slice(0, CURSOR_PREVIEW_LEN)}…`;
 }
 
+/** Bounded human duration for a skew: s, m, h, d, then years. */
+function formatSkew(absMs: number): string {
+  const dayMs = 86_400_000;
+  if (absMs < 60_000) return `${(absMs / 1000).toFixed(1)}s`;
+  if (absMs < 3_600_000) return `${Math.round(absMs / 60_000)}m`;
+  if (absMs < 3_600_000 * 24) return `${Math.round(absMs / 3_600_000)}h`;
+  if (absMs < dayMs * 365) return `${Math.round(absMs / dayMs)}d`;
+  return `${Math.round(absMs / (dayMs * 365))}y`;
+}
+
+/**
+ * Human rendering of the chain clock skew, shared by `/status` and `/health`.
+ *
+ * `chainClockAt` is the newest chain close time the poller observed; the skew
+ * is `nowMs - chainClockAt`. The wording always names the side that is ahead,
+ * because a bare "+3s" or "behind" is ambiguous about which clock is wrong.
+ *
+ * Returns plain text (no Markdown): pass it through `escapeMd` before putting
+ * it in a Telegram message. `unknown` before the first observation, `in sync`
+ * inside one second, otherwise a bounded `s`/`m`/`h`/`d`/`y` duration.
+ */
+export function chainClockLabel(chainClockAt: number | null | undefined, nowMs: number): string {
+  if (typeof chainClockAt !== "number" || !Number.isFinite(chainClockAt)) return "unknown";
+  const skewMs = nowMs - chainClockAt;
+  const abs = Math.abs(skewMs);
+  if (abs < 1_000) return "in sync";
+  const human = formatSkew(abs);
+  return skewMs >= 0
+    ? `local clock ${human} ahead of chain`
+    : `chain clock ${human} ahead of local`;
+}
+
 /**
  * Build a health report from poller status.
  *
@@ -86,10 +141,24 @@ export function buildHealthReport(
   nowMs: number = Date.now(),
 ): HealthReport {
   const uptimeMs = poller.startedAt > 0 ? Math.max(0, nowMs - poller.startedAt) : 0;
+  // Tolerate a status snapshot that never learned about the chain clock (and
+  // any non-finite value): the report must stay JSON-serialisable, never NaN.
+  const chainClockAt =
+    typeof poller.chainClockAt === "number" && Number.isFinite(poller.chainClockAt)
+      ? poller.chainClockAt
+      : null;
 
   let status: HealthReport["status"];
   if (!poller.running) {
     status = "stopped";
+  } else if (poller.stopping === true) {
+    // A deliberate drain is doing exactly what it was asked to do. It is not a
+    // stale or failing poller, and `poller.stopping` is how clients tell the
+    // difference from an operator pause.
+    status = "ok";
+  } else if (poller.paused) {
+    // A deliberate operator pause is healthy, not a stale or failing poller.
+    status = "ok";
   } else {
     const failureBudget = Math.max(3, Math.ceil(60_000 / Math.max(config.pollIntervalMs, 1)));
     const tooManyFailures = poller.consecutiveFailures >= failureBudget;
@@ -110,18 +179,27 @@ export function buildHealthReport(
     checkedAt: new Date(nowMs).toISOString(),
     poller: {
       running: poller.running,
+      paused: poller.paused === true,
+      stopping: poller.stopping === true,
+      channelPreviewMode: config.channelPreviewMode === true,
       cycles: poller.cycles,
       lastPollAt: iso(poller.lastPollAt),
       lastSuccessAt: iso(poller.lastSuccessAt),
       latestLedger: poller.latestLedger,
       oldestLedger: poller.oldestLedger,
+      chainClockAt: iso(chainClockAt),
+      chainClockSkewMs: chainClockAt === null ? null : nowMs - chainClockAt,
       notificationsSent: poller.notificationsSent,
       notificationsFailed: poller.notificationsFailed,
       eventsSkipped: poller.eventsSkipped,
+      eventsDeduplicated: poller.eventsDeduplicated ?? 0,
+      notificationsDropped: poller.notificationsDropped ?? 0,
       consecutiveFailures: poller.consecutiveFailures,
       lastError: poller.lastError
         ? { at: new Date(poller.lastError.at).toISOString(), message: poller.lastError.message }
         : null,
+      pendingFlush: poller.pendingFlush === true,
+      lastFlushAt: iso(poller.lastFlushAt ?? null),
       targets: poller.targets.map((t) => ({
         source: t.source,
         contractId: t.contractId,

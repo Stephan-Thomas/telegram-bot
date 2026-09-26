@@ -13,6 +13,7 @@
 import { txExplorerUrl } from "../stellar/client.js";
 import {
   formatUsdc,
+  isUsableTxHash,
   shortAddress,
   squadSideLabel,
   winnerSideLabel,
@@ -22,9 +23,57 @@ import type { StellarConfig } from "../config.js";
 
 /** Telegram's MarkdownV2 reserved set. All of it must be escaped, everywhere. */
 const MDV2_RESERVED = /[_*[\]()~`>#+\-=|{}.!\\]/g;
+const MAX_EVENT_FIELD_LENGTH = 200;
+const MAX_TX_HASH_LENGTH = 128;
 
 export function escapeMd(text: string): string {
   return text.replace(MDV2_RESERVED, (ch) => `\\${ch}`);
+}
+
+/**
+ * Best-effort text for an unknown thrown value, without assuming it is an
+ * `Error`. The SDK throws Soroban JSON-RPC failures as plain
+ * `{ code, message }` objects (js-stellar-sdk `rpc/jsonrpc.ts`), and
+ * `String()` of those is the useless `"[object Object]"` — so object-shaped
+ * errors are read field-wise and only then fall back to a bounded dump.
+ */
+function describeError(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  if (error === null || error === undefined) return "";
+  if (typeof error === "object") {
+    const record = error as { code?: unknown; message?: unknown };
+    const code =
+      typeof record.code === "number" || typeof record.code === "string" ? record.code : null;
+    if (typeof record.message === "string" && record.message !== "") {
+      return code === null ? record.message : `${code}: ${record.message}`;
+    }
+    try {
+      const json = JSON.stringify(error);
+      if (typeof json === "string" && json !== "{}") return json;
+    } catch {
+      // Circular or exotic object; fall through to the generic label.
+    }
+    return code === null ? "error object" : `error code ${code}`;
+  }
+  return String(error);
+}
+
+/**
+ * Keep operational errors actionable without copying remote payloads or the
+ * bot token into logs and status messages.
+ */
+export function safeErrorMessage(error: unknown, secrets: readonly string[] = []): string {
+  let message = describeError(error);
+  for (const secret of secrets) {
+    if (secret) message = message.split(secret).join("[REDACTED]");
+  }
+
+  // Also cover a Telegram token embedded in an upstream error when the
+  // caller does not have the configured value (for example in a unit test).
+  message = message.replace(/\b\d{6,12}:[A-Za-z0-9_-]{20,}\b/g, "[REDACTED]");
+
+  const compact = message.replace(/\s+/g, " ").trim() || "unknown error";
+  return compact.length <= 240 ? compact : `${compact.slice(0, 239)}…`;
 }
 
 function usdc(units: bigint): string {
@@ -35,16 +84,71 @@ function who(address: string): string {
   return `\`${escapeMd(shortAddress(address))}\``;
 }
 
-/** Truncate an unbounded contract String before it sizes a chat message. */
-function clip(text: string, max = 200): string {
+/** Truncate an unbounded contract String without splitting a Unicode code point. */
+function clip(text: string, max = MAX_EVENT_FIELD_LENGTH): string {
   const trimmed = text.trim();
-  return trimmed.length <= max ? trimmed : `${trimmed.slice(0, max - 1)}…`;
+  const characters = Array.from(trimmed);
+  return characters.length <= max ? trimmed : `${characters.slice(0, max - 1).join("")}…`;
 }
 
 function footer(config: StellarConfig, event: DecodedEvent): string {
   const ledger = escapeMd(`ledger ${event.ledger}`);
-  if (!event.txHash) return `_${ledger}_`;
-  return `_${ledger}_ · [tx](${txExplorerUrl(config, event.txHash)})`;
+  const url = eventExplorerUrl(config, event);
+  if (!url) return `_${ledger}_`;
+  return `_${ledger}_ · [tx](${url})`;
+}
+
+/**
+ * A Stellar transaction hash as returned by the RPC: 64 lowercase or uppercase
+ * hex characters (32 bytes). Anything else is treated as missing — the
+ * notification is still sent, just without an explorer link/button.
+ */
+const TX_HASH_RE = /^[0-9a-fA-F]{64}$/;
+
+/** Explorer URL for an event's transaction, or null when it has none usable. */
+export function eventExplorerUrl(config: StellarConfig, event: DecodedEvent): string | null {
+  // Link only well-formed 64-hex transaction hashes. An externally-derived
+  // identifier that is empty, oversized or malformed gets no link: a broken
+  // explorer link is worse than no link, and the hash itself is never altered here.
+  const raw = event.txHash ?? "";
+  if (raw.length > MAX_TX_HASH_LENGTH || !isUsableTxHash(raw)) return null;
+  const txHash = raw.trim();
+  if (!TX_HASH_RE.test(txHash)) return null;
+  try {
+    const url = txExplorerUrl(config, txHash);
+    const parsed = new URL(url);
+    if (parsed.protocol !== "https:") return null;
+    return url;
+  } catch {
+    return null;
+  }
+}
+
+export interface ExplorerButton {
+  text: string;
+  url: string;
+}
+
+export interface ExplorerKeyboard {
+  inline_keyboard: ExplorerButton[][];
+}
+
+/**
+ * Telegram inline keyboard for an event notification.
+ *
+ * Returns undefined when the event carries no usable transaction hash, so the
+ * caller sends the existing text-only message unchanged. The button reuses the
+ * same canonical explorer URL as the `· [tx](…)` footer link — the footer stays
+ * as the text fallback, the button is progressive enhancement in the same
+ * Telegram request (no second message, no extra rate-limit cost).
+ */
+export function explorerKeyboard(
+  config: StellarConfig,
+  event: DecodedEvent,
+): ExplorerKeyboard | undefined {
+  const url = eventExplorerUrl(config, event);
+  if (!url) return undefined;
+  return { inline_keyboard: [[{ text: "View on Explorer", url }]] };
 }
 
 /**
@@ -63,7 +167,7 @@ function headline(event: DecodedEvent): string | null {
     case "claim_created":
       return (
         `🆕 *New claim* \\#${p.claimId}\n` +
-        `Category: ${escapeMd(p.category)}\n` +
+        `Category: ${escapeMd(clip(p.category))}\n` +
         `Creator: ${who(p.creator)}`
       );
 
@@ -154,8 +258,93 @@ function headline(event: DecodedEvent): string | null {
 }
 
 /** The full message, or null when the event is not worth notifying. */
-export function formatEvent(config: StellarConfig, event: DecodedEvent): string | null {
-  const head = headline(event);
-  if (head === null) return null;
-  return `${head}\n${footer(config, event)}`;
+export function formatEvent(
+  config: StellarConfig & { channelPreviewMode?: boolean },
+  event: DecodedEvent,
+): string | null {
+  try {
+    const head = headline(event);
+    if (head === null) return null;
+    const body = `${head}\n${footer(config, event)}`;
+    if (config.channelPreviewMode) {
+      return `🧪 *[PREVIEW MODE]*\n${body}`;
+    }
+    return body;
+  } catch (err) {
+    return formatFallbackEvent(config, event, safeErrorMessage(err));
+  }
 }
+
+/**
+ * Fallback message when an event payload is malformed or an error occurs during formatting.
+ */
+export function formatFallbackEvent(
+  config: StellarConfig,
+  event: DecodedEvent,
+  reason = "malformed payload",
+): string {
+  const source = escapeMd(event.source ?? "unknown");
+  const contract = escapeMd(shortAddress(event.contractId ?? "unknown"));
+  const ledger = escapeMd(String(event.ledger ?? "unknown"));
+  const safeReason = escapeMd(safeErrorMessage(reason));
+  const txPart = event.txHash ? ` · [tx](${txExplorerUrl(config, event.txHash)})` : "";
+  return (
+    `⚠️ *Event Notification Fallback* \\(${source}\\)\n` +
+    `Contract: \`${contract}\` · Ledger: ${ledger}${txPart}\n` +
+    `Reason: _${safeReason}_`
+  );
+}
+
+/**
+ * Generate a channel preview message for on-demand preview commands.
+ */
+export function previewMessage(config: StellarConfig, target = "market"): string {
+  const isSquad = target.trim().toLowerCase() === "squad";
+
+  if (isSquad) {
+    const sampleEvent: DecodedEvent = {
+      source: "squad",
+      contractId: config.squadContractId,
+      ledger: 1000000,
+      txHash: "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+      at: Math.floor(Date.now() / 1000),
+      eventId: "1000000-1",
+      eventType: "contract",
+      transactionIndex: 0,
+      operationIndex: 0,
+      inSuccessfulContractCall: true,
+      payload: {
+        name: "market_created",
+        marketId: 1,
+        question: "Will Stellar process 1M Soroban operations in 24 hours?",
+        captain: "GDZCB3D6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
+        feeBps: 100,
+        deadline: 1770000000,
+      },
+    };
+    const formatted = formatEvent({ ...config, channelPreviewMode: false }, sampleEvent) ?? "";
+    return `🧪 *Channel Preview — mimir\\-squad*\n\n${formatted}`;
+  }
+
+  const sampleEvent: DecodedEvent = {
+    source: "market",
+    contractId: config.marketContractId,
+    ledger: 1000000,
+    txHash: "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+    at: Math.floor(Date.now() / 1000),
+    eventId: "1000000-0",
+    eventType: "contract",
+    transactionIndex: 0,
+    operationIndex: 0,
+    inSuccessfulContractCall: true,
+    payload: {
+      name: "claim_created",
+      claimId: 1,
+      category: "crypto",
+      creator: "GBMGZ3D6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
+    },
+  };
+  const formatted = formatEvent({ ...config, channelPreviewMode: false }, sampleEvent) ?? "";
+  return `🧪 *Channel Preview — mimir\\-market*\n\n${formatted}`;
+}
+
