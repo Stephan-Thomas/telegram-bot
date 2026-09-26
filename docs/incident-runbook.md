@@ -8,6 +8,7 @@ Operational guidance for recovering the Mimir Telegram notifier from missed noti
 * The notifier is read-only and never holds signing keys or private keys.
 * A notification failure must not alter on-chain state.
 * Cursors must only move according to the poller's existing persistence rules.
+* A shutdown flush may only persist cursors the poller already advanced; it never invents a resume position.
 * Logs and status output must not expose bot tokens, private keys, payment proofs, or unbounded remote payloads.
 
 Notification text from contract String fields is bounded to 200 Unicode code
@@ -166,6 +167,30 @@ Never replace a cursor with an arbitrary ledger or cursor value unless the repos
 
 ## Process restart
 
+### Stopping the process
+
+`SIGTERM`/`SIGINT` starts a bounded drain instead of killing the loop:
+
+1. New poll cycles stop being scheduled and `/status` reports `stopping`.
+2. Notifications not yet sent are dropped and counted
+   (`dropped during shutdown`), with one bounded log line. The chain, not
+   Telegram, remains the record.
+3. The cycle in progress is given `SHUTDOWN_TIMEOUT_MS` (default `10000`) to
+   finish and write its cursors.
+4. Any cursor state still only in memory is flushed to `CURSOR_FILE`, then the
+   health endpoint and the Telegram long-poll are closed and the process exits
+   `0`.
+5. If that teardown itself wedges, the process exits `1` after
+   `SHUTDOWN_TIMEOUT_MS + 10000` ms. The flush has already happened by then.
+
+Send a second `SIGTERM`/`SIGINT` only if the drain is genuinely stuck: it exits
+immediately (`130`/`143`) and skips the flush. The cursor file itself cannot be
+truncated by that, because it is written to a temporary file and renamed.
+
+After a drain, `GET /health` reports `poller.stopping` and `poller.pendingFlush`.
+`pendingFlush: true` after the process should have exited means the flush did
+not land — check disk permissions and the persistent volume before restarting.
+
 ### Persistent deployment
 
 Ensure `data/` or the path configured by `CURSOR_FILE` is on persistent storage.
@@ -219,7 +244,10 @@ Do not modify on-chain state or attempt to repair an event by writing to the Mim
 
 For a deployment containing only documentation or operational changes:
 
-1. Stop the affected deployment according to its hosting platform's procedure; use `/pause` only to stop scheduling while leaving the process available.
+1. Stop the affected deployment according to its hosting platform's procedure.
+   A `SIGTERM` drains: cursors are flushed and unsent notifications are dropped
+   and counted. Use `/pause` only to stop scheduling while leaving the process
+   available.
 2. Revert to the previously known-good application revision.
 3. Preserve the persistent `data/` volume.
 4. Restart the known-good revision.

@@ -3,7 +3,8 @@
  *
  * Startup is fail-fast (a bad config exits non-zero with the reasons listed);
  * everything after startup is fail-soft, because the whole point of this process
- * is to still be running next week.
+ * is to still be running next week. Shutdown is the mirror image: one bounded
+ * drain, one cursor flush, then exit.
  */
 
 import { ConfigError, activeProfileName, loadConfig, networkLabel } from "./config.js";
@@ -53,6 +54,7 @@ async function main(): Promise<void> {
   console.log(`[boot] market       ${config.marketContractId}`);
   console.log(`[boot] squad        ${config.squadContractId}`);
   console.log(`[boot] cursor file  ${config.cursorFile}`);
+  console.log(`[boot] shutdown     ${config.shutdownTimeoutMs}ms drain budget`);
   console.log(
     `[boot] operator      ${config.operatorTelegramUserId === null ? "disabled" : "configured"}`,
   );
@@ -108,21 +110,68 @@ async function main(): Promise<void> {
 
   await poller.start();
 
+  let shuttingDown = false;
+
+  /**
+   * First signal: drain. The poller stops scheduling, drops what it has not
+   * sent, waits a bounded time for the cycle in flight, and flushes its cursor
+   * state — so the restart resumes where this process actually stopped.
+   *
+   * Second signal: the operator is out of patience. Exiting without the flush
+   * is still safe for the file itself (write-then-rename), and the cost is a
+   * cold-ish resume bounded by the last completed cycle.
+   */
   const shutdown = (signal: string) => {
-    console.log(`[shutdown] ${signal} received, stopping`);
-    poller.stop();
-    void healthServer
-      .close()
-      .catch((err: unknown) => {
+    if (shuttingDown) {
+      console.warn(`[shutdown] ${signal} received again during drain; forcing exit`);
+      process.exit(signal === "SIGINT" ? 130 : 143);
+    }
+    shuttingDown = true;
+    console.log(`[shutdown] ${signal} received, draining`);
+
+    // The drain is already bounded by SHUTDOWN_TIMEOUT_MS; this covers the
+    // teardown after it (health socket, grammy stop) so a wedged close cannot
+    // outlive the deploy. The cursor flush happens before either, so an exit
+    // here has already persisted state. Unref'd: it never delays a clean exit.
+    const teardownBudgetMs = config.shutdownTimeoutMs + 10_000;
+    const watchdog: NodeJS.Timeout = setTimeout(() => {
+      console.warn(
+        `[shutdown] teardown still running after ${teardownBudgetMs}ms; exiting without it`,
+      );
+      process.exit(1);
+    }, teardownBudgetMs);
+    watchdog.unref();
+
+    void (async () => {
+      try {
+        const result = await poller.shutdown();
+        console.log(
+          `[shutdown] poller ${result.drained ? "drained" : "hit the drain deadline"}; ` +
+            `cursor ${result.flushed ? "flushed" : "flush failed"} after ${result.waitedMs}ms`,
+        );
+      } catch (err: unknown) {
+        console.error(`[shutdown] poller drain failed: ${safeErrorMessage(err)}`);
+      }
+
+      try {
+        await healthServer.close();
+      } catch (err: unknown) {
         console.error(`[shutdown] health server close failed: ${safeErrorMessage(err)}`);
-      })
-      .finally(() => {
-        void bot.stop().finally(() => process.exit(0));
-      });
+      }
+
+      try {
+        await bot.stop();
+      } catch (err: unknown) {
+        console.error(
+          `[shutdown] telegram stop failed: ${safeErrorMessage(err, [config.botToken])}`,
+        );
+      }
+      process.exit(0);
+    })();
   };
 
-  process.once("SIGINT", () => shutdown("SIGINT"));
-  process.once("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
 }
 
 main().catch((err: unknown) => {

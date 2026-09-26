@@ -37,7 +37,7 @@ Do not wire `npm run scan` into automated tests.
 | `tests/fixtures.test.mjs` | Loads the fixture catalog and asserts notify / skip / boundary behaviour |
 | `tests/format.test.mjs` | Inline event-formatting units (MarkdownV2, USDC, Telegram send failures) |
 | `tests/bot.test.mjs` | Mocked grammy operator-command routing and exact reply payloads |
-| `tests/poller.test.mjs` | Cursor load/advance, RPC and Telegram failure, send cap, stop semantics |
+| `tests/poller.test.mjs` | Cursor load/advance, RPC and Telegram failure, send cap, stop semantics, graceful-shutdown flush, drain deadline, shutdown notification drop |
 | `tests/poller-controls.test.mjs` | Pause/resume boundaries, restart cursor compatibility, RPC failure redaction |
 | `tests/cursor-restart.test.mjs` | Stale cursors, unwritable data dir, restart round-trip |
 | `tests/ledger-window.test.mjs` | Ledger-window bounds: clamping, out-of-window cursors, malformed-XDR scanner safety, restart |
@@ -45,6 +45,7 @@ Do not wire `npm run scan` into automated tests.
 | `tests/soak.test.mjs` | Long-run memory/timer/log boundedness under scripted RPC and Telegram failures (mock timers, forced GC, leak control) |
 | `tests/mock-rpc.test.mjs` | Live mock RPC: scanner walks, poller failure drills, cursor safety, log bounds |
 | `tests/mock-profile.test.mjs` | `MIMIR_PROFILE=mock` defaults, explicit-env precedence, unknown-profile failure |
+| `tests/config.test.mjs` | Env loading and validation, including the `SHUTDOWN_TIMEOUT_MS` drain budget |
 
 ## Event fixture schema
 
@@ -138,6 +139,8 @@ test("resumes", () =>
 | Telegram send error | **commits after partial delivery** | counted as failed | Fake `sendMessage` reject; assert cursor advances and no token appears in the Error message |
 | Corrupt cursor file | cold start | n/a | Use `cursor-corrupt.txt` contents |
 | Burst over cap | advances | extras skipped | Cap `MAX_NOTIFICATIONS_PER_CYCLE` in the fake config |
+| Graceful shutdown mid-cycle | **flushed** if the cycle advanced it, untouched otherwise | the in-flight send finishes; the rest are dropped and counted | Fake a second target that blocks after the first advanced; assert the file the restarted poller loads |
+| Shutdown deadline expires | whatever was already on disk — never clobbered | the abandoned cycle may lose its remaining sends | Fake a server that never resolves; assert the file is byte-identical and no `.tmp` is left behind |
 | Unauthorized `/pause` or `/resume` | untouched | no command reply | Mock grammy with a different Telegram user id |
 | Operator pause → restart | version-1 cursor unchanged | no replay | Reload a valid cursor fixture; pause must not persist |
 
