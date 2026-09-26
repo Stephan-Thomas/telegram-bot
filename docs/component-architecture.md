@@ -87,6 +87,7 @@ The scanner handles cursor-paginated event retrieval from Soroban RPC. It is des
 - **Sequential pagination**: Uses opaque cursors; cannot parallelize
 - **Mutual exclusion**: `startLedger`/`endLedger` and `cursor` are mutually exclusive in requests
 - **Retention awareness**: Queries `getHealth()` to get the retained-history floor
+- **Window validation**: The floor and tip are validated before the first request; a start ledger below the floor is clamped up, and a start ledger above the tip or a resume cursor above the tip is refused with a bounded error. A cursor below the floor is still forwarded, so retention stays the RPC's call and its bounded stale rejection surfaces in `/status`
 - **Page termination**: Walk stops when cursor stops moving or reaches chain tip
 - **Bounded scanning**: Limited to `EVENT_MAX_PAGES` (20) pages per scan
 
@@ -210,6 +211,7 @@ Load from file → Use in RPC request → Receive new cursor → Process events 
 
 - **Corrupt file**: Treated as cold start
 - **RPC-rejected cursor**: Kept unchanged; error visible in `/status`
+- **Out-of-window cursor**: Refused locally with a bounded `LedgerWindowError`; the stored cursor is kept unchanged and no request is sent
 - **Recovery**: Follow incident runbook, not automatic rewind
 
 ### Restart Behavior

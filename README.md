@@ -133,8 +133,10 @@ npm run scan -- --json --show 20 # JSON including 20 decoded events per contract
 Human mode prints the ledger window, an event-name histogram, and the decoded
 payloads. With `--json`, stdout is a single `mimir-scan-v1` document (bigints as
 decimal strings) and progress goes to stderr, so `npm run scan -- --json | jq`
-stays valid. Neither mode prints bot tokens or signing keys — the scanner never
-holds them. This is how the decoder was verified against the live deployment.
+stays valid. Each target reports its `startLedger` and `startClamped`, so it is
+clear when a requested `--from` was moved up to the retained floor. Neither mode
+prints bot tokens or signing keys — the scanner never holds them. This is how the
+decoder was verified against the live deployment.
 
 ## Local mock profile
 
@@ -176,6 +178,10 @@ design of `src/stellar/events.ts`:
 - The RPC keeps only a **rolling window** of events (~120,960 ledgers, roughly a
   week, on Testnet). A `startLedger` below the retained floor is an *error*, not
   an empty result, so the floor is clamped from `getHealth()` first.
+- The window from `getHealth()` is **validated before the first request**: an
+  inverted or malformed window fails with a bounded error, a start ledger below
+  the floor is clamped up to it, and `npm run scan -- --from <future>` is refused
+  rather than silently reading a different range.
 - **An empty page does not mean the scan is finished.** One request covers a
   bounded slice of ledgers and returns whatever was in it — frequently nothing —
   plus a cursor to continue from. Terminating on a short page (the correct
@@ -267,6 +273,15 @@ This process is meant to stay up for weeks, so a single failure never ends it:
   that cursor, the error becomes visible in `/status`, and scheduled retries or
   `/resume` use the same position. Recovery follows the incident runbook rather
   than replacing an opaque cursor with a guessed ledger.
+- **A request outside the retained window never reaches the RPC in one piece.**
+  The window (`oldestLedger`…`latestLedger`) is validated from `getHealth()`; a
+  resume cursor that the token itself places *above* the chain tip is refused
+  before it is sent, with a bounded error in `/status` and logs and the stored
+  cursor left unchanged. A cursor *below* the retained floor is deliberately
+  still forwarded: retention is the RPC's call, and its bounded stale rejection
+  is what surfaces in `/status` while the stored cursor stays put. A cursor shape
+  the bot cannot read is forwarded too, so an RPC cursor-format change cannot
+  wedge it.
 - **A burst** is capped at `MAX_NOTIFICATIONS_PER_CYCLE` messages per cycle,
   spaced out, so Telegram's rate limiter is never the thing that takes the bot
   down. RPC, Telegram, and poller error text shown in `/status` or logs is
@@ -378,7 +393,7 @@ drift is caught locally without network access. To change dependencies, edit
 `package.json`, run `npm install` to regenerate the lockfile, and commit both
 files together — a lockfile that no longer matches `package.json` fails
 `npm ci`, `npm run lockfile:check`, and CI.
-Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic command, poller, format, fixture, mock-profile and health suites (`npm run test:mock` for just the local-mock suites), or `npm run build` to produce the production output. CI runs typecheck, build, and all tests without network credentials.
+Run `npm run typecheck` for a no-emit TypeScript check, `npm test` for the build plus the deterministic command, poller, ledger-window, format, fixture, mock-profile and health suites (`npm run test:mock` for just the local-mock suites), or `npm run build` to produce the production output. CI runs typecheck, build, and all tests without network credentials.
 
 Contributor workflow for credential-free fixtures (event catalogs, cursor samples, failure-mode expectations) lives in [docs/contributor-fixtures.md](docs/contributor-fixtures.md). Automated tests never require live Testnet RPC access, Telegram credentials, or signing keys.
 

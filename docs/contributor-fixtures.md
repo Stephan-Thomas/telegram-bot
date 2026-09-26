@@ -40,6 +40,7 @@ Do not wire `npm run scan` into automated tests.
 | `tests/poller.test.mjs` | Cursor load/advance, RPC and Telegram failure, send cap, stop semantics |
 | `tests/poller-controls.test.mjs` | Pause/resume boundaries, restart cursor compatibility, RPC failure redaction |
 | `tests/cursor-restart.test.mjs` | Stale cursors, unwritable data dir, restart round-trip |
+| `tests/ledger-window.test.mjs` | Ledger-window bounds: clamping, out-of-window cursors, malformed-XDR scanner safety, restart |
 | `tests/helpers/temp-data.mjs` | Ephemeral data directory helper shared by persistence tests |
 | `tests/soak.test.mjs` | Long-run memory/timer/log boundedness under scripted RPC and Telegram failures (mock timers, forced GC, leak control) |
 | `tests/mock-rpc.test.mjs` | Live mock RPC: scanner walks, poller failure drills, cursor safety, log bounds |
@@ -132,6 +133,8 @@ test("resumes", () =>
 | Failure | Cursor | Notification | Fixture tip |
 | --- | --- | --- | --- |
 | RPC error for one contract | **unchanged** for that target | none that cycle | Fake rejected `readContractEvents`; assert cursor string identical |
+| Ledger-window violation (start ledger or cursor **above** the tip) | **unchanged** | none that cycle | Fake `getHealth` window plus an out-of-window value; assert a bounded `LedgerWindowError` and that no `getEvents` request is sent |
+| Cursor **below** the retained floor (stale) | **unchanged** | none that cycle | Fake `getHealth` window plus a stale cursor; assert the cursor is forwarded and the RPC's bounded stale rejection is surfaced |
 | Telegram send error | **commits after partial delivery** | counted as failed | Fake `sendMessage` reject; assert cursor advances and no token appears in the Error message |
 | Corrupt cursor file | cold start | n/a | Use `cursor-corrupt.txt` contents |
 | Burst over cap | advances | extras skipped | Cap `MAX_NOTIFICATIONS_PER_CYCLE` in the fake config |

@@ -14,8 +14,10 @@
  *  - The RPC keeps only a ROLLING WINDOW of events (~120_960 ledgers, about a
  *    week, on Testnet). A `startLedger` below the retained `oldestLedger` is an
  *    ERROR, not an empty result — so the floor is clamped from `getHealth()`
- *    before the first request. This is also why event history can never be the
- *    source of truth for current state.
+ *    before the first request. A `startLedger` ABOVE the tip, or a resume cursor
+ *    outside the window, is likewise an error, and is refused here with a
+ *    bounded message instead of being sent. This is also why event history can
+ *    never be the source of truth for current state.
  *  - **AN EMPTY PAGE DOES NOT MEAN THE SCAN IS DONE.** This is the trap. One
  *    request scans a bounded slice of ledgers and returns whatever it found
  *    there — frequently nothing — plus a cursor to carry on from. Stopping on a
@@ -38,7 +40,13 @@ import { pathToFileURL } from "node:url";
 import type { rpc } from "@stellar/stellar-sdk";
 
 import { loadStellarConfig, networkLabel } from "../config.js";
-import { createRpcServer } from "./client.js";
+import {
+  clampStartLedger,
+  createRpcServer,
+  LedgerWindowError,
+  validateLedgerWindow,
+  type LedgerWindow,
+} from "./client.js";
 import { decodeEvent, formatUsdc, type ContractSource, type DecodedEvent } from "./decode.js";
 
 /** Events per request. The RPC caps this; 200 is well inside it. */
@@ -72,6 +80,10 @@ export interface RawScan {
   /** True when `maxPages` stopped the walk before the tip. */
   truncated: boolean;
   pages: number;
+  /** Ledger the walk started from after clamping, or null when resuming. */
+  startLedger: number | null;
+  /** True when the requested start was below the retained floor and clamped up. */
+  startClamped: boolean;
 }
 
 /**
@@ -91,6 +103,34 @@ export function eventCursorLedger(cursor: string): number | null {
   }
 }
 
+/** Where a resume cursor falls relative to the retained window. */
+export type ResumeCursorIssue = "cursor-before-floor" | "cursor-after-tip";
+
+/**
+ * Place a resume cursor relative to the retained window.
+ *
+ * Returns null when the cursor is inside the window *or* when its ledger cannot
+ * be read from the opaque token. Opacity matters: a cursor shape this build does
+ * not understand must still be forwarded to the RPC, so only a cursor this build
+ * can *positively* place outside the window is classified at all.
+ *
+ * `cursor-before-floor` is a retention boundary the RPC owns, so it is
+ * classified but still forwarded — the documented contract is that a stale
+ * cursor is kept and Soroban's bounded rejection surfaces in `/status`.
+ * `cursor-after-tip` is impossible for a token this chain minted, so the caller
+ * refuses it rather than sending a request that is guaranteed to fail.
+ */
+export function resumeCursorProblem(
+  cursor: string,
+  window: LedgerWindow,
+): ResumeCursorIssue | null {
+  const ledger = eventCursorLedger(cursor);
+  if (ledger === null) return null;
+  if (ledger < window.oldestLedger) return "cursor-before-floor";
+  if (ledger > window.latestLedger) return "cursor-after-tip";
+  return null;
+}
+
 export async function paginatedGetEvents(
   server: rpc.Server,
   filters: rpc.Api.EventFilter[],
@@ -99,16 +139,45 @@ export async function paginatedGetEvents(
   const limit = Math.max(1, opts.limit ?? EVENT_PAGE_LIMIT);
   const maxPages = Math.max(1, opts.maxPages ?? EVENT_MAX_PAGES);
 
-  const health = await server.getHealth();
-  const oldestLedger = health.oldestLedger;
+  const window = validateLedgerWindow(await server.getHealth());
+  const oldestLedger = window.oldestLedger;
 
   const events: rpc.Api.EventResponse[] = [];
   let cursor: string | undefined = opts.cursor;
   let lastCursor: string | null = opts.cursor ?? null;
   let previousCursor = "";
-  let latestLedger = health.latestLedger;
+  let latestLedger = window.latestLedger;
   let truncated = false;
   let pages = 0;
+
+  // Resolve the first request against the window before spending it: a cursor
+  // wins over `startLedger` (the RPC rejects both together), and a start ledger
+  // is placed inside the window.
+  let startLedger: number | null = null;
+  let startClamped = false;
+
+  if (cursor) {
+    // Only a cursor above the tip is refused here. A cursor below the retained
+    // floor is forwarded: retention is the RPC's to judge, and the documented
+    // behaviour is to keep the cursor and surface its bounded stale rejection.
+    if (resumeCursorProblem(cursor, window) === "cursor-after-tip") {
+      const ledger = eventCursorLedger(cursor);
+      throw new LedgerWindowError(
+        "cursor-after-tip",
+        `cursor ledger ${ledger} is ahead of the chain tip ${window.latestLedger}`,
+      );
+    }
+  } else {
+    const requestedStart = Math.max(
+      1,
+      Number(opts.startLedger ?? window.latestLedger - (opts.lookbackLedgers ?? 0)),
+    );
+    const clamped = clampStartLedger(requestedStart, window);
+    startLedger = clamped.startLedger;
+    startClamped = clamped.clamped;
+  }
+
+  const firstStartLedger = startLedger ?? window.oldestLedger;
 
   for (;;) {
     if (pages >= maxPages) {
@@ -117,18 +186,11 @@ export async function paginatedGetEvents(
     }
     pages += 1;
 
-    const requestedStart =
-      opts.startLedger ?? Math.max(1, health.latestLedger - (opts.lookbackLedgers ?? 0));
-
     // The two request shapes are a discriminated union on `cursor`, so they are
     // built separately rather than spread into one object.
     const response: rpc.Api.GetEventsResponse = cursor
       ? await server.getEvents({ filters, cursor, limit })
-      : await server.getEvents({
-          filters,
-          startLedger: Math.max(requestedStart, oldestLedger),
-          limit,
-        });
+      : await server.getEvents({ filters, startLedger: firstStartLedger, limit });
 
     const rawEvents = Array.isArray(response?.events) ? response.events : [];
     events.push(...rawEvents);
@@ -150,7 +212,16 @@ export async function paginatedGetEvents(
     cursor = nextCursor;
   }
 
-  return { events, cursor: lastCursor, latestLedger, oldestLedger, truncated, pages };
+  return {
+    events,
+    cursor: lastCursor,
+    latestLedger,
+    oldestLedger,
+    truncated,
+    pages,
+    startLedger,
+    startClamped,
+  };
 }
 
 export interface WatchTarget {
@@ -190,6 +261,8 @@ export async function readContractEvents(
     oldestLedger: scan.oldestLedger,
     truncated: scan.truncated,
     pages: scan.pages,
+    startLedger: scan.startLedger,
+    startClamped: scan.startClamped,
     lastEventLedger: ledgers.length > 0 ? Math.max(...ledgers) : null,
   };
 }
@@ -248,6 +321,10 @@ export interface ScanJsonTarget {
   truncated: boolean;
   lastEventLedger: number | null;
   cursor: string | null;
+  /** Ledger the walk started from after clamping, or null when resuming. */
+  startLedger: number | null;
+  /** True when the requested start was below the retained floor and clamped up. */
+  startClamped: boolean;
   histogram: Record<string, number>;
   /** Last N decoded events (controlled by `--show`); never includes secrets. */
   events: ScanJsonEvent[];
@@ -285,6 +362,8 @@ export function buildScanJsonTarget(scan: ContractScan, show: number): ScanJsonT
     truncated: scan.truncated,
     lastEventLedger: scan.lastEventLedger,
     cursor: scan.cursor,
+    startLedger: scan.startLedger ?? null,
+    startClamped: scan.startClamped ?? false,
     histogram: eventHistogram(scan.events),
     // slice(-0) would return everything, so show=0 must be special-cased
     events: (limit > 0 ? scan.events.slice(-limit) : []).map((event) => ({
@@ -414,7 +493,8 @@ async function main(): Promise<void> {
 
     console.log(
       `pages=${scan.pages} events=${scan.events.length} truncated=${scan.truncated} ` +
-        `lastEventLedger=${scan.lastEventLedger} cursor=${scan.cursor}`,
+        `lastEventLedger=${scan.lastEventLedger} cursor=${scan.cursor} ` +
+        `start=${scan.startLedger ?? "cursor"}${scan.startClamped ? " (clamped)" : ""}`,
     );
     for (const [name, count] of Object.entries(counts)) {
       console.log(`  ${count.toString().padStart(4)}  ${name}`);

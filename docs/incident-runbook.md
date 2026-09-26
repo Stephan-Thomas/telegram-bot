@@ -124,6 +124,13 @@ the bounded RPC error in `/status`, and retries the same position. `/resume`
 also leaves it unchanged. This avoids duplicate notifications or skipped chain
 history from a guessed reset.
 
+A cursor the token itself places **ahead of the chain tip** is refused locally
+with a bounded `ahead of the chain tip` error instead of being sent, and the
+stored cursor is kept unchanged. That can be a transient RPC-lag condition and
+clears as the tip advances; if it persists it means the cursor came from a
+different chain (for example a network reset), so treat it as incompatible:
+preserve the file and perform the deliberate cold start above.
+
 Before changing `CURSOR_FILE` or deleting persisted state, preserve the existing file for investigation if possible.
 
 If the stored cursor is confirmed incompatible or permanently outside RPC retention, stop the notifier, preserve the cursor file for investigation, and deliberately perform a cold start with the configured `START_LOOKBACK_LEDGERS` after checking the retained-history floor. This may produce duplicate notifications, but it does not skip or replay all retained history.
