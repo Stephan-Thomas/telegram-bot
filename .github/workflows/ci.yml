@@ -9,25 +9,45 @@ permissions:
   contents: read
 
 
-# CI compiles only. There are deliberately no live network calls here: the
-# poller's correctness against real chain data is verified with `npm run scan`
-# against Testnet by hand, and a CI job that depended on a public RPC and a
-# Telegram token would fail for reasons that have nothing to do with the commit.
+# CI is deterministic: no live RPC or Telegram calls. The poller's chain
+# correctness against live data is verified separately with `npm run scan`.
+#
+# Node version matrix:
+#   20 – minimum per package.json engines (">=20"), matches Dockerfile base image
+#   22 – current LTS, used in production
+#   24 – newest LTS, validates forward compatibility
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [20, 22, 24]
+    name: Node ${{ matrix.node-version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: 22
+          node-version: ${{ matrix.node-version }}
           cache: npm
 
       - run: npm ci
+
+      # `npm ci` proves the lockfile installs; these prove it is the lockfile we
+      # meant to commit: pinned to the registry, in sync with package.json, and
+      # unchanged when npm regenerates it from itself.
+      - name: Lockfile consistency
+        run: npm run lockfile:check
+
+      - name: Lockfile reproducibility
+        run: npm run lockfile:reproduce
 
       - name: Typecheck
         run: npm run typecheck
 
       - name: Build
         run: npm run build
+
+      - name: Test
+        run: npm test

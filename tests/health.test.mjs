@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { createBot, healthMessage, registerCommands } from "../dist/bot.js";
 import { buildHealthReport, startHealthServer } from "../dist/health.js";
 
 function baseConfig(overrides = {}) {
@@ -12,6 +13,7 @@ function baseConfig(overrides = {}) {
     networkPassphrase: "Test SDF Network ; September 2015",
     botToken: "0000000000:SECRET-TOKEN-DO-NOT-LEAK",
     chatId: "-1001234567890",
+    operatorTelegramUserId: null,
     pollIntervalMs: 30_000,
     startLookbackLedgers: 60,
     cursorFile: "./data/cursor.json",
@@ -26,12 +28,14 @@ function baseConfig(overrides = {}) {
 function baseStatus(overrides = {}) {
   return {
     running: true,
+    paused: false,
     startedAt: 1_000,
     cycles: 4,
     lastPollAt: 5_000,
     lastSuccessAt: 5_000,
     latestLedger: 42,
     oldestLedger: 1,
+    chainClockAt: 5_000,
     notificationsSent: 2,
     notificationsFailed: 0,
     eventsSkipped: 1,
@@ -57,13 +61,31 @@ test("buildHealthReport is ok for a fresh running poller", () => {
   assert.equal(report.service, "mimir-telegram-bot");
   assert.equal(report.network, "testnet");
   assert.equal(report.uptimeMs, 4_500);
+  assert.equal(report.poller.channelPreviewMode, false);
   assert.equal(report.poller.targets[0].cursorPreview.endsWith("…"), true);
 });
+
+test("buildHealthReport reflects enabled channelPreviewMode", () => {
+  const report = buildHealthReport(baseConfig({ channelPreviewMode: true }), baseStatus(), 5_500);
+  assert.equal(report.poller.channelPreviewMode, true);
+});
+
 
 test("buildHealthReport is stopped when the poller is not running", () => {
   const report = buildHealthReport(baseConfig(), baseStatus({ running: false }), 5_500);
   assert.equal(report.ok, false);
   assert.equal(report.status, "stopped");
+});
+
+test("buildHealthReport treats an operator pause as healthy", () => {
+  const report = buildHealthReport(
+    baseConfig({ healthStaleMs: 1 }),
+    baseStatus({ paused: true, lastSuccessAt: 1_000, consecutiveFailures: 10 }),
+    5_000,
+  );
+  assert.equal(report.ok, true);
+  assert.equal(report.status, "ok");
+  assert.equal(report.poller.paused, true);
 });
 
 test("buildHealthReport is degraded after repeated failures", () => {
@@ -134,6 +156,9 @@ test("GET /health returns 200 and redacted JSON for a healthy poller", async () 
     const body = await res.json();
     assert.equal(body.ok, true);
     assert.equal(body.status, "ok");
+    // Chain clock: baseStatus saw chain time at 5_000, the probe runs at 5_500.
+    assert.equal(body.poller.chainClockAt, new Date(5_000).toISOString());
+    assert.equal(body.poller.chainClockSkewMs, 500);
     const text = JSON.stringify(body);
     assert.equal(text.includes(secret), false);
     assert.equal(text.includes(chat), false);
@@ -164,3 +189,230 @@ test("GET /health boundary: first boot before any success stays ok", () => {
   assert.equal(report.ok, true);
   assert.equal(report.status, "ok");
 });
+
+test("buildHealthReport surfaces a draining shutdown without calling it degraded", () => {
+  // Stale success + repeated failures would be degraded for a running poller;
+  // a deliberate drain is doing what it was told to do.
+  const report = buildHealthReport(
+    baseConfig({ healthStaleMs: 1 }),
+    baseStatus({
+      stopping: true,
+      pendingFlush: true,
+      notificationsDropped: 3,
+      lastFlushAt: 6_000,
+      lastSuccessAt: 1_000,
+      consecutiveFailures: 10,
+    }),
+    5_500,
+  );
+
+  assert.equal(report.ok, true);
+  assert.equal(report.status, "ok");
+  assert.equal(report.poller.stopping, true);
+  assert.equal(report.poller.pendingFlush, true);
+  assert.equal(report.poller.notificationsDropped, 3);
+  assert.equal(report.poller.lastFlushAt, new Date(6_000).toISOString());
+});
+
+test("buildHealthReport reports stopped once a shutdown has finished", () => {
+  const report = buildHealthReport(
+    baseConfig(),
+    baseStatus({ running: false, stopping: true }),
+    5_500,
+  );
+  assert.equal(report.ok, false);
+  assert.equal(report.status, "stopped");
+  assert.equal(report.poller.stopping, true);
+});
+
+test("buildHealthReport fills in the shutdown fields when a status omits them", () => {
+  const report = buildHealthReport(baseConfig(), baseStatus(), 5_500);
+  assert.equal(report.poller.stopping, false);
+  assert.equal(report.poller.pendingFlush, false);
+  assert.equal(report.poller.notificationsDropped, 0);
+  assert.equal(report.poller.lastFlushAt, null);
+});
+
+test("createBot /health command replies with exact MarkdownV2 payload for healthy poller", async () => {
+  const config = baseConfig();
+  const now = Date.now();
+  const status = baseStatus({ lastSuccessAt: now, lastPollAt: now, startedAt: now - 1000 });
+  const bot = createBot({ config, status: () => status });
+  bot.botInfo = {
+    id: 1000,
+    is_bot: true,
+    first_name: "TestBot",
+    username: "test_bot",
+    can_join_groups: true,
+    can_read_all_group_messages: true,
+    supports_inline_queries: false,
+    can_connect_to_business: false,
+    has_main_web_app: false,
+  };
+
+  const sent = [];
+  bot.api.config.use(async (_prev, method, payload) => {
+    if (method === "sendMessage") {
+      sent.push(payload);
+      return { ok: true, result: { message_id: 101, text: payload.text, chat: { id: payload.chat_id, type: "supergroup" }, date: 1700000000 } };
+    }
+    return { ok: true, result: true };
+  });
+
+  const update = {
+    update_id: 1,
+    message: {
+      message_id: 10,
+      date: 1700000000,
+      chat: { id: Number(config.chatId), type: "supergroup" },
+      from: { id: 100, is_bot: false, first_name: "Tester" },
+      text: "/health",
+      entities: [{ type: "bot_command", offset: 0, length: 7 }],
+    },
+  };
+
+  await bot.handleUpdate(update);
+
+  assert.equal(sent.length, 1);
+  assert.equal(String(sent[0].chat_id), config.chatId);
+  assert.equal(sent[0].parse_mode, "MarkdownV2");
+  assert.deepEqual(sent[0].link_preview_options, { is_disabled: true });
+
+  const text = sent[0].text;
+  assert.ok(text.includes("*Health* — OK on Stellar testnet"));
+  assert.ok(text.includes("Status: `ok` \\(ok\\)"));
+  assert.ok(text.includes("Poller: running"));
+  assert.ok(text.includes("Chain tip: 42"));
+  assert.doesNotMatch(text, /SECRET-TOKEN/);
+});
+
+test("createBot /health command reflects degraded status on RPC failure", async () => {
+  const config = baseConfig();
+  const status = baseStatus({
+    consecutiveFailures: 5,
+    lastError: { at: 5_000, message: "RPC endpoint timeout (504)" },
+    targets: [
+      {
+        source: "market",
+        contractId: config.marketContractId,
+        cursor: "0018276211125911551-4294967295",
+        lastEventLedger: 40,
+        lastError: "RPC endpoint timeout (504)",
+      },
+    ],
+  });
+  const bot = createBot({ config, status: () => status });
+  bot.botInfo = {
+    id: 1000,
+    is_bot: true,
+    first_name: "TestBot",
+    username: "test_bot",
+    can_join_groups: true,
+    can_read_all_group_messages: true,
+    supports_inline_queries: false,
+    can_connect_to_business: false,
+    has_main_web_app: false,
+  };
+
+  const sent = [];
+  bot.api.config.use(async (_prev, method, payload) => {
+    if (method === "sendMessage") {
+      sent.push(payload);
+      return { ok: true, result: { message_id: 102, text: payload.text, chat: { id: payload.chat_id, type: "supergroup" }, date: 1700000000 } };
+    }
+    return { ok: true, result: true };
+  });
+
+  await bot.handleUpdate({
+    update_id: 2,
+    message: {
+      message_id: 11,
+      date: 1700000000,
+      chat: { id: Number(config.chatId), type: "supergroup" },
+      from: { id: 100, is_bot: false, first_name: "Tester" },
+      text: "/health",
+      entities: [{ type: "bot_command", offset: 0, length: 7 }],
+    },
+  });
+
+  assert.equal(sent.length, 1);
+  const text = sent[0].text;
+  assert.ok(text.includes("*Health* — DEGRADED on Stellar testnet"));
+  assert.ok(text.includes("Status: `degraded` \\(action required\\)"));
+  assert.ok(text.includes("consecutive failures: 5"));
+  assert.ok(text.includes("RPC endpoint timeout \\(504\\)"));
+});
+
+test("createBot /health command reflects stopped status when poller is off", async () => {
+  const config = baseConfig();
+  const status = baseStatus({ running: false });
+  const bot = createBot({ config, status: () => status });
+  bot.botInfo = {
+    id: 1000,
+    is_bot: true,
+    first_name: "TestBot",
+    username: "test_bot",
+    can_join_groups: true,
+    can_read_all_group_messages: true,
+    supports_inline_queries: false,
+    can_connect_to_business: false,
+    has_main_web_app: false,
+  };
+
+  const sent = [];
+  bot.api.config.use(async (_prev, method, payload) => {
+    if (method === "sendMessage") {
+      sent.push(payload);
+      return { ok: true, result: { message_id: 103, text: payload.text, chat: { id: payload.chat_id, type: "supergroup" }, date: 1700000000 } };
+    }
+    return { ok: true, result: true };
+  });
+
+  await bot.handleUpdate({
+    update_id: 3,
+    message: {
+      message_id: 12,
+      date: 1700000000,
+      chat: { id: Number(config.chatId), type: "supergroup" },
+      from: { id: 100, is_bot: false, first_name: "Tester" },
+      text: "/health",
+      entities: [{ type: "bot_command", offset: 0, length: 7 }],
+    },
+  });
+
+  assert.equal(sent.length, 1);
+  const text = sent[0].text;
+  assert.ok(text.includes("*Health* — STOPPED on Stellar testnet"));
+  assert.ok(text.includes("Poller: stopped"));
+});
+
+test("healthMessage escapes MarkdownV2 reserved characters in error messages", () => {
+  const config = baseConfig();
+  const status = baseStatus({
+    consecutiveFailures: 3,
+    lastError: { at: 5_000, message: "Error with _*[]()~`>#+-=|{}.! special characters" },
+  });
+
+  const msg = healthMessage(config, status, 5_500);
+  assert.ok(msg.includes("\\_\\*\\[\\]\\(\\)\\~\\`\\>\\#\\+\\-\\=\\|\\{\\}\\.\\!"));
+  assert.equal(msg.includes(config.botToken), false);
+});
+
+test("registerCommands registers /health command with setMyCommands", async () => {
+  const calls = [];
+  const fakeBot = {
+    api: {
+      setMyCommands: async (cmds) => {
+        calls.push(cmds);
+      },
+    },
+  };
+
+  await registerCommands(fakeBot);
+  assert.equal(calls.length, 1);
+  const registered = calls[0];
+  const healthCmd = registered.find((c) => c.command === "health");
+  assert.ok(healthCmd);
+  assert.equal(healthCmd.description, "Health assessment and operational readiness");
+});
+
