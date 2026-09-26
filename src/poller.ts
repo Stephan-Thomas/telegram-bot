@@ -44,6 +44,7 @@ import type { rpc } from "@stellar/stellar-sdk";
 import type { SendExtra } from "./bot.js";
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, type BotConfig } from "./config.js";
 import { explorerKeyboard, formatEvent, safeErrorMessage } from "./notifications/format.js";
+import { buildStatusSnapshot, writeStatusFile, type StatusSnapshot } from "./status.js";
 import { readContractEvents, type WatchTarget } from "./stellar/events.js";
 import type { ContractSource, DecodedEvent } from "./stellar/decode.js";
 
@@ -530,6 +531,24 @@ export function createPoller(deps: PollerDeps) {
     }
   }
 
+  // ── Status snapshot ────────────────────────────────────────────────────────
+
+  /**
+   * Write the machine-readable snapshot. Called after every cycle, and on
+   * start/stop, so an operator reading the file always sees the last completed
+   * cycle rather than a stale one from boot.
+   */
+  async function persistStatus(): Promise<void> {
+    await writeStatusFile(config.statusFile, snapshot());
+  }
+
+  function snapshot(): StatusSnapshot {
+    return buildStatusSnapshot(config, {
+      ...status,
+      targets: [...state.values()].map((t) => ({ ...t })),
+    });
+  }
+
   // ── One cycle ──────────────────────────────────────────────────────────────
 
   interface NotificationResult {
@@ -798,6 +817,7 @@ export function createPoller(deps: PollerDeps) {
       try {
         status.targets = [...state.values()].map((t) => ({ ...t }));
         await saveCursors("cycle");
+        await persistStatus();
       } finally {
         inFlight = false;
         endCycleTracking();
@@ -848,6 +868,7 @@ export function createPoller(deps: PollerDeps) {
         `[poller] watching market=${config.marketContractId} squad=${config.squadContractId} ` +
           `every ${config.pollIntervalMs}ms`,
       );
+      await persistStatus();
       void loop();
     },
 
@@ -886,6 +907,9 @@ export function createPoller(deps: PollerDeps) {
       resumePending = false;
       if (timer) clearTimeout(timer);
       timer = null;
+      // Best-effort: the process may be exiting, but a final snapshot that says
+      // `running: false` is what tells a supervisor the stop was deliberate.
+      void persistStatus();
     },
 
     /**
@@ -944,11 +968,17 @@ export function createPoller(deps: PollerDeps) {
       }
 
       status.running = false;
+      await persistStatus();
       return { drained, flushed, waitedMs: Math.max(0, now() - startedAt) };
     },
 
     status(): PollerStatus {
       return { ...status, targets: [...state.values()].map((t) => ({ ...t })) };
+    },
+
+    /** Machine-readable snapshot, same shape as the file on disk. */
+    snapshot(): StatusSnapshot {
+      return snapshot();
     },
   };
 }

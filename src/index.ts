@@ -7,6 +7,8 @@
  * drain, one cursor flush, then exit.
  */
 
+import { readFile } from "node:fs/promises";
+
 import { ConfigError, activeProfileName, loadConfig, networkLabel } from "./config.js";
 import { createBot, createNotifier, registerCommands, type SendExtra } from "./bot.js";
 import { startHealthServer } from "./health.js";
@@ -14,6 +16,7 @@ import { createPoller } from "./poller.js";
 import type { ContractSource } from "./stellar/decode.js";
 import { safeErrorMessage } from "./notifications/format.js";
 import { createRpcServer } from "./stellar/client.js";
+import { boundText } from "./status.js";
 
 /**
  * Installed before anything else can throw, so a rejection during startup is
@@ -34,8 +37,43 @@ function installProcessHandlers(): void {
   });
 }
 
+/**
+ * `--status` prints the last snapshot written by a running (or stopped) bot and
+ * exits. It reads the file only — it never contacts Telegram or the RPC — so it
+ * is safe to run from a health check, a cron job, or a shell on a box where the
+ * bot is already running. Exit code 0 when a snapshot was read, 1 otherwise.
+ */
+async function printStatus(): Promise<void> {
+  const config = loadConfig();
+  let raw: string;
+  try {
+    raw = await readFile(config.statusFile, "utf8");
+  } catch {
+    console.error(
+      `[status] no snapshot at ${config.statusFile}; is the bot running? ` +
+        `(set STATUS_FILE to point at the running instance's file)`,
+    );
+    process.exit(1);
+  }
+
+  try {
+    // Re-serialize rather than echoing the raw bytes: a corrupt or hand-edited
+    // file must not be able to inject arbitrary text into a log or a pipe.
+    const parsed = JSON.parse(raw) as unknown;
+    console.log(JSON.stringify(parsed, null, 2));
+  } catch (err) {
+    console.error(`[status] snapshot is not valid JSON: ${boundText(String(err))}`);
+    process.exit(1);
+  }
+}
+
 async function main(): Promise<void> {
   installProcessHandlers();
+
+  if (process.argv.includes("--status")) {
+    await printStatus();
+    return;
+  }
 
   const config = loadConfig();
 

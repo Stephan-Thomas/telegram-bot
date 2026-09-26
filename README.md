@@ -119,6 +119,69 @@ response and cannot mutate poller state. Repeated `/pause` or `/resume` commands
 are idempotent. Control state is process-local: a restart resumes polling and
 loads the existing version-1 cursor file.
 
+## Machine-readable status snapshot
+
+`/status` is for a human in the chat. For a supervisor, a dashboard, or a shell
+on the box, the poller also writes the same facts as JSON to `STATUS_FILE`
+(default `data/status.json`) after every cycle, and on start and stop:
+
+```bash
+npm start -- --status          # or: node dist/index.js --status
+```
+
+```json
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-08-21T10:00:00.000Z",
+  "uptimeMs": 3600000,
+  "running": true,
+  "network": "testnet",
+  "rpcUrl": "https://soroban-testnet.stellar.org",
+  "chatId": "-…7890",
+  "pollIntervalMs": 30000,
+  "maxNotificationsPerCycle": 20,
+  "cycles": 120,
+  "lastPollAt": 1755770400000,
+  "lastSuccessAt": 1755770400000,
+  "latestLedger": 4226733,
+  "oldestLedger": 4105773,
+  "notificationsSent": 11,
+  "notificationsFailed": 0,
+  "eventsSkipped": 3,
+  "consecutiveFailures": 0,
+  "lastError": null,
+  "targets": [
+    {
+      "source": "market",
+      "contractId": "CDV6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
+      "cursor": "0018276211125911551-4294967295",
+      "lastEventLedger": 4226729,
+      "lastError": null
+    }
+  ]
+}
+```
+
+`--status` reads the file only — it never contacts Telegram or the RPC — so it is
+safe to run from a health check or a cron job while the bot is running. It exits
+`0` when a snapshot was read and `1` when there is none or it is not valid JSON.
+
+**What is deliberately not in it.** The snapshot is built from an allowlist of
+fields, so nothing can leak by accident. It never contains the bot token, a
+private key, or a payment proof. The chat id is redacted to its sign and last
+four digits (`-…7890`), and every string that comes from outside the process —
+RPC errors, Telegram errors, cursors — is whitespace-collapsed and truncated
+(`MAX_ERROR_CHARS`, 300) so a hostile or chatty endpoint cannot write an
+unbounded blob into the file or into a log line. The write is atomic
+(write-then-rename), so a reader never sees a half-written document.
+
+**Reading it in a health check.** `running: false` means the process stopped
+deliberately (SIGINT/SIGTERM) or has not started; `consecutiveFailures > 0` with
+a fresh `lastPollAt` means the RPC is failing but the loop is alive; a
+`generatedAt` that stops advancing means the process is wedged or gone. The
+chain remains the source of truth — this file reports on the reader, it is not a
+substitute for reading the chain.
+
 ## Reading events without a bot token
 
 The chain reader runs standalone. Testnet's Soroban RPC is public and
@@ -293,6 +356,7 @@ This process is meant to stay up for weeks, so a single failure never ends it:
   wedge it.
 - **A burst** is capped at `MAX_NOTIFICATIONS_PER_CYCLE` messages per cycle,
   spaced out, so Telegram's rate limiter is never the thing that takes the bot
+
   down. RPC, Telegram, and poller error text shown in `/status` or logs is
   compact, bounded, and the configured bot token is redacted.
 - **A long Stellar outage** freezes the chain clock at the newest close time the
@@ -304,6 +368,9 @@ This process is meant to stay up for weeks, so a single failure never ends it:
 - **An operator pause** prevents new cycles but cannot cancel a bounded scan or
   Telegram retry loop already in progress. That cycle follows the normal cursor
   rules above; `/resume` starts the next cycle immediately.
+- **A status file that cannot be written** is logged and ignored; it is an
+  observability signal, never a reason to stop notifying. A corrupt snapshot
+  makes `--status` exit `1` rather than print garbage.
 - **A shutdown** stops scheduling, drops what has not been sent yet, waits at
   most `SHUTDOWN_TIMEOUT_MS` for the cycle in progress, and flushes any cursor
   state that is still only in memory — see
@@ -430,6 +497,7 @@ src/
   config.ts                env loading and validation, fails fast (MIMIR_PROFILE profiles)
   bot.ts                   grammy setup: /start, /help, /status, /contracts, operator pause/resume
   poller.ts                the loop: scan, notify, persist the cursor
+  status.ts                machine-readable status snapshot (allowlisted, bounded)
   stellar/
     client.ts              Soroban RPC client + explorer links (tx + contract)
     events.ts              cursor-paginated getEvents (+ the standalone CLI)
